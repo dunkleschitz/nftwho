@@ -1,0 +1,3711 @@
+#!/usr/bin/env python3
+"""nftwho — which rule in which chain of an nftables ruleset file decides
+one fully specified packet at one traversal, and where that rule lives.
+
+Static, pre-deploy adjudication over a ruleset file plus its include tree.
+Never loads a ruleset, never invokes nft on user files, never reads the
+live kernel ruleset. Semantics pinned in DESIGN-nftwho.md (NF00-NF31).
+Stdlib only.
+"""
+import argparse
+import glob
+import ipaddress
+import json
+import os
+import re
+import sys
+
+VERSION = "1.0.0"
+
+# ---------------------------------------------------------------- constants
+
+PRIORITY_KEYWORDS = {
+    "raw": -300, "mangle": -150, "dstnat": -100, "filter": 0,
+    "security": 50, "srcnat": 100,
+}
+BRIDGE_PRIORITY_KEYWORDS = {
+    "dstnat": -300, "filter": -200, "srcnat": 300,
+}
+CT_STATES = {"new", "established", "related", "invalid", "untracked"}
+PROTOCOLS = {
+    "hopopt": 0, "icmp": 1, "igmp": 2, "ggp": 3, "ipencap": 4, "st": 5,
+    "tcp": 6, "egp": 8, "igp": 9, "pup": 12, "udp": 17, "hmp": 20,
+    "xns-idp": 22, "rdp": 27, "iso-tp4": 29, "dccp": 33, "ipv6": 41,
+    "ipv6-route": 43, "ipv6-frag": 44, "idrp": 45, "rsvp": 46, "gre": 47,
+    "esp": 50, "ah": 51, "ipv6-icmp": 58, "icmpv6": 58, "ipv6-nonxt": 59,
+    "ipv6-opts": 60, "eigrp": 88, "ospf": 89, "pim": 103, "vrrp": 112,
+    "l2tp": 115, "isis": 124, "sctp": 132, "fc": 133, "manet": 138,
+    "mobility-header": 135, "udplite": 136, "mpls-in-ip": 137,
+}
+ICMP_TYPES = {
+    "echo-reply": 0, "destination-unreachable": 3, "source-quench": 4,
+    "redirect": 5, "echo-request": 8, "router-advertisement": 9,
+    "router-solicitation": 10, "time-exceeded": 11,
+    "parameter-problem": 12, "timestamp-request": 13,
+    "timestamp-reply": 14, "info-request": 15, "info-reply": 16,
+    "address-mask-request": 17, "address-mask-reply": 18,
+}
+ICMPV6_TYPES = {
+    "destination-unreachable": 1, "packet-too-big": 2,
+    "time-exceeded": 3, "parameter-problem": 4, "echo-request": 128,
+    "echo-reply": 129, "mld-listener-query": 130, "mld-listener-report": 131,
+    "mld-listener-done": 132, "router-solicitation": 133,
+    "router-advertisement": 134, "neighbour-solicitation": 135,
+    "neighbour-advertisement": 136, "redirect": 137,
+}
+TCP_FLAG_BITS = {"fin": 1, "syn": 2, "rst": 4, "psh": 8, "ack": 16,
+                 "urg": 32, "ece": 64, "cwr": 128}
+
+HOOKS = {"prerouting", "input", "forward", "output", "postrouting",
+         "ingress"}
+PATH_HOOKS = {
+    "in": ["ingress", "prerouting", "input"],
+    "forward": ["ingress", "prerouting", "forward", "postrouting"],
+    "out": ["output", "postrouting"],
+}
+FAMILIES = {"ip", "ip6", "inet", "arp", "bridge", "netdev"}
+# Which table families can see an ip-family packet traversal.
+FAMILY_PACKET = {"ipv4": {"ip", "inet"}, "ipv6": {"ip6", "inet"}}
+
+# Caps (NF30): adversarial-input bounds; exceeding any is a load failure.
+MAX_STREAM_BYTES = 10 * 1024 * 1024
+MAX_TOKENS = 1000000
+MAX_INCLUDE_DEPTH = 16
+MAX_INCLUDE_FILES = 1000
+MAX_DEFINE_DEPTH = 32
+MAX_DEFINE_EXPANSION = 100000
+MAX_CHAIN_DEPTH = 32
+
+LOAD_FAILURE = "load-failure"
+
+
+class LoadError(Exception):
+    """Unrecoverable load failure: exit 2 with the cap/reason named."""
+
+
+class Tri:
+    TRUE = "TRUE"
+    FALSE = "FALSE"
+    UNKNOWN = "UNKNOWN"
+
+
+def tri_and(values):
+    if Tri.FALSE in values:
+        return Tri.FALSE
+    if Tri.UNKNOWN in values:
+        return Tri.UNKNOWN
+    return Tri.TRUE
+
+
+def tri_not(value):
+    if value == Tri.TRUE:
+        return Tri.FALSE
+    if value == Tri.FALSE:
+        return Tri.TRUE
+    return Tri.UNKNOWN
+
+
+# ---------------------------------------------------------------- tokenizer
+
+class Token:
+    __slots__ = ("text", "file", "line", "quoted")
+
+    def __init__(self, text, file, line, quoted=False):
+        self.text = text
+        self.file = file
+        self.line = line
+        self.quoted = quoted
+
+    def __repr__(self):
+        return "Tok(%r@%s:%d)" % (self.text, self.file, self.line)
+
+
+_WORD_START = re.compile(r"[A-Za-z0-9_@$/]")
+_WORD_CHAR = re.compile(r"[A-Za-z0-9_./:+@$]")
+
+
+def tokenize(text, fname):
+    """NF00 tokenizer: braces/semicolons/operators are distinct tokens,
+    quoted strings are single tokens even with spaces/braces/# inside,
+    comments run # to end of line outside quotes."""
+    toks = []
+    i, n = 0, len(text)
+    line = 1
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            line += 1
+            i += 1
+        elif c in " \t\r":
+            i += 1
+        elif c == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+        elif c == '"':
+            j = i + 1
+            buf = []
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n:
+                    buf.append(text[j + 1])
+                    j += 2
+                else:
+                    if text[j] == "\n":
+                        line += 1
+                    buf.append(text[j])
+                    j += 1
+            if j >= n:
+                raise LoadError("unterminated quoted string in %s:%d" % (fname, line))
+            toks.append(Token("".join(buf), fname, line, quoted=True))
+            i = j + 1
+        elif text[i:i + 2] in ("==", "!=", ">=", "<=", "<<", ">>"):
+            toks.append(Token(text[i:i + 2], fname, line))
+            i += 2
+        elif c in "{};,.":
+            toks.append(Token(c, fname, line))
+            i += 1
+        elif c in "&|<>=":
+            toks.append(Token(c, fname, line))
+            i += 1
+        elif c == "-" and i + 1 < n and text[i + 1].isdigit() \
+                and (i == 0 or not _WORD_CHAR.match(text[i - 1])):
+            # negative number / standalone minus
+            toks.append(Token("-", fname, line))
+            i += 1
+        elif _WORD_START.match(c):
+            j = i
+            while j < n and _WORD_CHAR.match(text[j]):
+                j += 1
+            # a '-' joins a word only when glued on both sides (8000-9000,
+            # eth-0, 10.0.0.10-10.0.0.20)
+            while j < n and text[j] == "-" and j + 1 < n \
+                    and _WORD_CHAR.match(text[j + 1]) \
+                    and _WORD_CHAR.match(text[j - 1]):
+                j += 1
+                while j < n and _WORD_CHAR.match(text[j]):
+                    j += 1
+            if j == i:
+                j = i + 1  # guarantee progress: never emit an empty token
+            toks.append(Token(text[i:j], fname, line))
+            i = j
+        elif c == "*":
+            toks.append(Token("*", fname, line))
+            i += 1
+        elif c == "!":
+            toks.append(Token("!", fname, line))
+            i += 1
+        elif c == "-":
+            toks.append(Token("-", fname, line))
+            i += 1
+        else:
+            # Any other stray character: keep as its own token so the
+            # recognizer can flag it rather than the loader dying.
+            toks.append(Token(c, fname, line))
+            i += 1
+    return toks
+
+
+# ---------------------------------------------------------------- stream loader
+
+class StreamLoader:
+    """NF02/NF03/NF04: one merged token stream with include expansion
+    (NF03) and sequential define substitution (NF04), under NF30 caps."""
+
+    def __init__(self, main_path, includepaths):
+        self.main_path = main_path
+        self.includepaths = list(includepaths or [])
+        self.files_read = []          # (path, via) in read order
+        self.include_edges = []       # (including file, pattern, resolved)
+        self.defines_expanded = []    # (name, file, line) of uses
+        self.findings = []            # loader-level findings
+        self._included_count = 0
+
+    def _read_file(self, path):
+        try:
+            with open(path, "r", errors="replace") as fh:
+                return fh.read()
+        except OSError as exc:
+            raise LoadError("cannot read %s: %s" % (path, exc))
+
+    def _resolve_include(self, pattern, including_file):
+        """NF03: --includepath dirs, then the including file's directory.
+        Returns a sorted list of resolved files (empty = wildcard no-match)."""
+        candidates = []
+        if os.path.isabs(pattern):
+            candidates.append(pattern)
+        else:
+            for d in self.includepaths:
+                candidates.append(os.path.join(d, pattern))
+            inc_dir = os.path.dirname(os.path.abspath(including_file))
+            candidates.append(os.path.join(inc_dir, pattern))
+        has_wild = any(ch in pattern for ch in "*?[")
+        seen = []
+        for cand in candidates:
+            if has_wild:
+                matches = sorted(glob.glob(cand))
+                # dotfiles are never matched by a wildcard (NF03)
+                matches = [m for m in matches
+                           if not os.path.basename(m).startswith(".")]
+                for m in matches:
+                    if m not in seen:
+                        seen.append(m)
+                if seen:
+                    break
+            else:
+                if os.path.isfile(cand):
+                    return [cand]
+        return seen
+
+    def _expand_file(self, path, via, stack):
+        if len(stack) > MAX_INCLUDE_DEPTH:
+            raise LoadError("include depth cap exceeded (%d) at %s"
+                            % (MAX_INCLUDE_DEPTH, path))
+        real = os.path.realpath(path)
+        if real in stack:
+            raise LoadError("include cycle involving %s" % path)
+        if self._included_count >= MAX_INCLUDE_FILES:
+            raise LoadError("include file cap exceeded (%d)"
+                            % MAX_INCLUDE_FILES)
+        self._included_count += 1
+        text = self._read_file(path)
+        if len(text) > MAX_STREAM_BYTES:
+            raise LoadError("stream size cap exceeded (%d bytes) at %s"
+                            % (MAX_STREAM_BYTES, path))
+        self.files_read.append((path, via))
+        toks = tokenize(text, path)
+        out = []
+        stack = stack + [real]
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            if tok.text == "include" and not tok.quoted \
+                    and i + 1 < len(toks) and toks[i + 1].quoted:
+                pattern = toks[i + 1].text
+                resolved = self._resolve_include(pattern, path)
+                has_wild = any(ch in pattern for ch in "*?[")
+                if not resolved and not has_wild:
+                    raise LoadError(
+                        "include %r in %s:%d resolves nowhere"
+                        % (pattern, tok.file, tok.line))
+                for target in resolved:
+                    self.include_edges.append((path, pattern, target))
+                    out.extend(self._expand_file(
+                        target, "include %r" % pattern, stack))
+                i += 2
+                continue
+            out.append(tok)
+            i += 1
+        return out
+
+    def load(self):
+        if not os.path.isfile(self.main_path):
+            raise LoadError("cannot read %s: no such file" % self.main_path)
+        toks = self._expand_file(self.main_path, "main file", [])
+        if len(toks) > MAX_TOKENS:
+            raise LoadError("token cap exceeded (%d)" % MAX_TOKENS)
+        return self._apply_defines(toks)
+
+    def _apply_defines(self, toks):
+        """Sequential single-pass define substitution (NF04). Returns a
+        list of statements (token lists); define statements are consumed."""
+        stmts = split_statements(toks)
+        defines = {}   # name -> (value tokens, file, line)
+        out = []
+        for stmt in stmts:
+            if len(stmt) >= 2 and stmt[0].text == "define" and not stmt[0].quoted:
+                name = stmt[1].text
+                if len(stmt) >= 4 and stmt[2].text == "=":
+                    defines[name] = (stmt[3:], stmt[1].file, stmt[1].line)
+                else:
+                    self.findings.append({
+                        "code": "unparseable",
+                        "message": "malformed define statement",
+                        "file": stmt[0].file, "line": stmt[0].line})
+                continue
+            expanded = self._expand_stmt(stmt, defines, 0)
+            out.append(expanded)
+        return out
+
+    def _expand_stmt(self, stmt, defines, depth):
+        out = []
+        for tok in stmt:
+            if tok.text.startswith("$") and not tok.quoted and len(tok.text) > 1:
+                name = tok.text[1:]
+                if name not in defines:
+                    # NF04: undefined define is a poison marker the parser
+                    # turns into [undefined-define] at that position.
+                    out.append(Token("__UNDEFINED_DEFINE__:" + name,
+                                     tok.file, tok.line))
+                    continue
+                if depth >= MAX_DEFINE_DEPTH:
+                    raise LoadError(
+                        "define expansion depth cap exceeded (%d) at %s:%d"
+                        % (MAX_DEFINE_DEPTH, tok.file, tok.line))
+                self.defines_expanded.append((name, tok.file, tok.line))
+                value, _vf, _vl = defines[name]
+                # Substituted tokens take the USE site's file:line, so
+                # statement splitting and rule provenance stay at the
+                # rule as written (the define's own site is recorded
+                # separately in defines_expanded).
+                out.extend(self._expand_tokens(value, defines, depth + 1,
+                                               tok))
+            else:
+                out.append(tok)
+        return out
+
+    def _expand_tokens(self, toks, defines, depth, use_tok=None):
+        out = []
+        for tok in toks:
+            if tok.text.startswith("$") and not tok.quoted and len(tok.text) > 1:
+                name = tok.text[1:]
+                if name not in defines:
+                    out.append(Token("__UNDEFINED_DEFINE__:" + name,
+                                     tok.file, tok.line))
+                    continue
+                if depth >= MAX_DEFINE_DEPTH:
+                    raise LoadError(
+                        "define expansion depth cap exceeded (%d) at %s:%d"
+                        % (MAX_DEFINE_DEPTH, tok.file, tok.line))
+                value, _vf, _vl = defines[name]
+                out.extend(self._expand_tokens(value, defines, depth + 1,
+                                               use_tok or tok))
+            else:
+                if use_tok is not None:
+                    out.append(Token(tok.text, use_tok.file, use_tok.line,
+                                     tok.quoted))
+                else:
+                    out.append(tok)
+        if len(out) > MAX_DEFINE_EXPANSION:
+            raise LoadError("define expansion cap exceeded (%d)"
+                            % MAX_DEFINE_EXPANSION)
+        return out
+
+
+_OPERATOR_TOKENS = {"==", "!=", ">=", "<=", ">", "<", "&", "|", "<<", ">>",
+                    "=", ",", ".", "-", "+", "in"}
+
+
+def split_statements(toks):
+    """NF00 statement orientation: split a token list into statements.
+    A statement ends at a ';' at brace depth 0, at a newline at brace
+    depth 0 (unless the buffer ends with an operator, i.e. the
+    statement continues), or at the matching close of an outer block.
+    Braces, quotes and comments are already handled by the tokenizer."""
+    stmts = []
+    buf = []
+    depth = 0
+    prev_line = None
+    prev_file = None
+    for tok in toks:
+        if tok.text == "{":
+            depth += 1
+        if depth == 0 and buf and (tok.file, tok.line) != (prev_file, prev_line) \
+                and buf[-1].text not in _OPERATOR_TOKENS \
+                and buf[-1].text != "{":
+            stmts.append(buf)
+            buf = []
+        if tok.text == "}" and depth > 0:
+            depth -= 1
+        if tok.text == ";" and depth == 0:
+            if buf:
+                stmts.append(buf)
+                buf = []
+            prev_line = tok.line
+            prev_file = tok.file
+            continue
+        buf.append(tok)
+        prev_line = tok.line
+        prev_file = tok.file
+    if buf:
+        stmts.append(buf)
+    return stmts
+
+
+def brace_body(toks):
+    """Return (inner tokens, rest) for a '{ ... }' starting at toks[0]."""
+    if not toks or toks[0].text != "{":
+        return None, toks
+    depth = 0
+    for i, tok in enumerate(toks):
+        if tok.text == "{":
+            depth += 1
+        elif tok.text == "}":
+            depth -= 1
+            if depth == 0:
+                return toks[1:i], toks[i + 1:]
+    return None, toks
+
+
+def split_top_commas(toks):
+    """Split token list on ',' at brace depth 0 (set/map element lists)."""
+    parts, buf, depth = [], [], 0
+    for tok in toks:
+        if tok.text == "{":
+            depth += 1
+        elif tok.text == "}":
+            depth -= 1
+        if tok.text == "," and depth == 0:
+            parts.append(buf)
+            buf = []
+        else:
+            buf.append(tok)
+    if buf:
+        parts.append(buf)
+    return [p for p in parts if p]
+
+
+def parse_int(text):
+    try:
+        return int(text, 0)
+    except (ValueError, TypeError):
+        return None
+
+# ---------------------------------------------------------------- model
+
+class Finding:
+    def __init__(self, code, message, file=None, line=None):
+        self.code = code
+        self.message = message
+        self.file = file
+        self.line = line
+
+    def where(self):
+        if self.file is not None:
+            return "%s:%s" % (self.file, self.line)
+        return "?"
+
+    def to_dict(self):
+        d = {"code": self.code, "message": self.message}
+        if self.file is not None:
+            d["file"] = self.file
+            d["line"] = self.line
+        return d
+
+
+class Table:
+    def __init__(self, family, name, file, line):
+        self.family = family
+        self.name = name
+        self.file = file
+        self.line = line
+        self.chains = {}     # name -> Chain (insertion order = stream order)
+        self.sets = {}       # name -> NamedSet
+        self.maps = {}       # name -> NamedMap
+        self.objects = {}    # counter/quota/limit/flowtable names
+
+
+class Chain:
+    def __init__(self, table, name, file, line):
+        self.table = table
+        self.name = name
+        self.file = file
+        self.line = line
+        self.type = None     # filter | nat | route | None (regular)
+        self.hook = None
+        self.priority = None
+        self.priority_raw = None
+        self.policy = "accept"
+        self.policy_line = line
+        self.rules = []
+        self.stream_index = 0
+        self.priority_poisoned = False
+
+    @property
+    def is_base(self):
+        return self.hook is not None
+
+    def ident(self):
+        return "%s %s %s" % (self.table.family, self.table.name, self.name)
+
+
+class NamedSet:
+    def __init__(self, table, name, file, line):
+        self.table = table
+        self.name = name
+        self.file = file
+        self.line = line
+        self.type = None
+        self.flags = set()
+        self.elements = []   # list of element specs
+        self.poisoned = False
+        self.poison_reason = None
+
+    @property
+    def dynamic(self):
+        return "dynamic" in self.flags
+
+    @property
+    def timeout(self):
+        return "timeout" in self.flags
+
+
+class NamedMap:
+    def __init__(self, table, name, file, line):
+        self.table = table
+        self.name = name
+        self.file = file
+        self.line = line
+        self.key_type = None
+        self.value_type = None
+        self.flags = set()
+        self.elements = []   # list of (key spec, value spec)
+        self.poisoned = False
+        self.poison_reason = None
+
+    @property
+    def is_verdict(self):
+        return self.value_type == "verdict"
+
+    @property
+    def dynamic(self):
+        return "dynamic" in self.flags
+
+    @property
+    def timeout(self):
+        return "timeout" in self.flags
+
+
+class Rule:
+    def __init__(self, chain, file, line):
+        self.chain = chain
+        self.file = file
+        self.line = line
+        self.matches = []    # list of Expr dicts
+        self.statements = []  # list of Stmt dicts
+        self.unparseable = False
+        self.unparseable_reason = None
+        self.text = ""
+
+    def has_terminal(self):
+        for st in self.statements:
+            if st["kind"] in ("accept", "drop", "reject", "queue",
+                              "jump", "goto", "nat"):
+                return True
+            if st["kind"] == "vmap":
+                return True
+        return False
+
+    def has_mutation(self):
+        return any(st["kind"] in ("mark-set", "ctmark-set", "notrack")
+                   for st in self.statements)
+
+
+# Value specs: dicts with "kind":
+#  lit (text), prefix (network), range (lo,hi as ints or ip ints),
+#  setlit (list of element specs), named (@set), tuple (list of specs),
+#  list (list of specs), hostname, service (name), unknown (reason, code)
+def v_lit(text):
+    return {"kind": "lit", "text": text}
+
+
+def v_unknown(code, message):
+    return {"kind": "unknown", "code": code, "message": message}
+
+
+def parse_number(text):
+    return parse_int(text)
+
+
+def looks_like_ip(text):
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_range_token(text):
+    """'8000-9000' or '10.0.0.10-10.0.0.20' -> (lo, hi) as ints, or None."""
+    if "-" not in text:
+        return None
+    parts = text.split("-")
+    if len(parts) != 2:
+        return None
+    lo, hi = parts
+    nlo, nhi = parse_int(lo), parse_int(hi)
+    if nlo is not None and nhi is not None:
+        return ("num", nlo, nhi)
+    try:
+        ilo = int(ipaddress.ip_address(lo))
+        ihi = int(ipaddress.ip_address(hi))
+        return ("ip", ilo, ihi)
+    except ValueError:
+        return None
+
+
+def parse_value_tokens(toks, ctx):
+    """Parse a value position: literal / prefix / range / { set } /
+    @named / comma list / hostname / service name. Consumes from the
+    front of toks (a list) and returns (value spec, remaining toks)."""
+    if not toks:
+        return v_unknown("unparseable", "missing value"), toks
+    tok = toks[0]
+    if tok.text.startswith("__UNDEFINED_DEFINE__"):
+        name = tok.text.split(":", 1)[1]
+        ctx.findings.append(Finding(
+            "undefined-define", "use of undefined define $%s" % name,
+            tok.file, tok.line))
+        return v_unknown("undefined-define",
+                         "undefined define $%s" % name), toks[1:]
+    if tok.text == "{":
+        inner, rest = brace_body(toks)
+        if inner is None:
+            return v_unknown("unparseable", "unbalanced { in value"), toks[1:]
+        elems = []
+        for part in split_top_commas(inner):
+            elem, _ = parse_value_tokens(part, ctx)
+            elems.append(elem)
+        return {"kind": "setlit", "elements": elems}, rest
+    if tok.text.startswith("@"):
+        return {"kind": "named", "name": tok.text[1:]}, toks[1:]
+    if tok.text == "*":
+        return {"kind": "lit", "text": "*"}, toks[1:]
+    # tuple / single value possibly followed by ', ...' list
+    first, rest = parse_single_value(tok, ctx)
+    if rest and rest[0].text == ",":
+        vals = [first]
+        rest = rest[1:]
+        while rest:
+            v, rest = parse_single_value(rest[0], ctx) if rest else (None, rest)
+            if v is None:
+                break
+            vals.append(v)
+            if rest and rest[0].text == ",":
+                rest = rest[1:]
+            else:
+                break
+        return {"kind": "list", "values": vals}, rest
+    return first, rest
+
+
+def parse_single_value(tok, ctx):
+    """One atomic value token (no braces, no @, no comma list)."""
+    text = tok.text
+    if text.startswith("__UNDEFINED_DEFINE__"):
+        name = text.split(":", 1)[1]
+        ctx.findings.append(Finding(
+            "undefined-define", "use of undefined define $%s" % name,
+            tok.file, tok.line))
+        return v_unknown("undefined-define",
+                         "undefined define $%s" % name), []
+    # range written as one token (8000-9000, 10.0.0.10-10.0.0.20)
+    rng = parse_range_token(text)
+    if rng is not None:
+        return {"kind": "range", "rtype": rng[0], "lo": rng[1],
+                "hi": rng[2]}, []
+    # range written as three tokens: VAL - VAL
+    if "/" in text and not text.startswith("/"):
+        try:
+            net = ipaddress.ip_network(text, strict=False)
+            return {"kind": "prefix", "network": net}, []
+        except ValueError:
+            pass
+    if looks_like_ip(text):
+        return v_lit(text), []
+    if parse_int(text) is not None:
+        return v_lit(text), []
+    if re.match(r"^[A-Za-z][A-Za-z0-9_.-]*$", text):
+        # A dotted name where an address belongs is a hostname (NF26);
+        # a bare word elsewhere is a symbolic constant / service name.
+        if "." in text:
+            return {"kind": "hostname", "text": text}, []
+        return v_lit(text), []
+    return v_lit(text), []
+
+
+def parse_set_element(toks, ctx):
+    """One element of a set/map element list: value, or tuple joined
+    by '.', or 'key : value' for maps (handled by caller)."""
+    # tuple: split on '.' tokens at depth 0
+    parts, buf, depth = [], [], 0
+    for tok in toks:
+        if tok.text == "{":
+            depth += 1
+        elif tok.text == "}":
+            depth -= 1
+        if tok.text == "." and depth == 0:
+            parts.append(buf)
+            buf = []
+        else:
+            buf.append(tok)
+    if buf:
+        parts.append(buf)
+    if len(parts) > 1:
+        vals = []
+        for part in parts:
+            v, _ = parse_value_tokens(part, ctx)
+            vals.append(v)
+        return {"kind": "tuple", "values": vals}
+    v, _ = parse_value_tokens(toks, ctx)
+    return v
+
+
+# ---------------------------------------------------------------- parser
+
+STATEMENT_KEYWORDS = {
+    "accept", "drop", "reject", "queue", "continue", "return", "jump",
+    "goto", "log", "counter", "notrack", "dup", "fwd", "synproxy",
+    "masquerade", "snat", "dnat", "redirect", "tproxy", "flow",
+    "reroute", "meter", "update", "limit", "quota",
+}
+FIELD_STARTS = {
+    "ip", "ip6", "tcp", "udp", "sctp", "icmp", "icmpv6", "th", "meta",
+    "ct", "iif", "oif", "iifname", "oifname", "fib", "ether", "vlan",
+    "arp", "jhash", "symhash", "numgen", "hash", "socket", "xt",
+    "limit", "quota", "meter",
+}
+# field name -> (canonical field, family or None)
+FIELD_TABLE = {
+    ("ip", "saddr"): ("ip-saddr", "ipv4"),
+    ("ip", "daddr"): ("ip-daddr", "ipv4"),
+    ("ip", "protocol"): ("ip-protocol", "ipv4"),
+    ("ip", "length"): ("ip-length", "ipv4"),
+    ("ip", "ttl"): ("ip-ttl", "ipv4"),
+    ("ip", "dscp"): ("ip-dscp", "ipv4"),
+    ("ip6", "saddr"): ("ip6-saddr", "ipv6"),
+    ("ip6", "daddr"): ("ip6-daddr", "ipv6"),
+    ("ip6", "nexthdr"): ("ip6-nexthdr", "ipv6"),
+    ("ip6", "flowlabel"): ("ip6-flowlabel", "ipv6"),
+    ("tcp", "sport"): ("tcp-sport", None),
+    ("tcp", "dport"): ("tcp-dport", None),
+    ("tcp", "flags"): ("tcp-flags", None),
+    ("udp", "sport"): ("udp-sport", None),
+    ("udp", "dport"): ("udp-dport", None),
+    ("sctp", "sport"): ("sctp-sport", None),
+    ("sctp", "dport"): ("sctp-dport", None),
+    ("th", "sport"): ("th-sport", None),
+    ("th", "dport"): ("th-dport", None),
+    ("icmp", "type"): ("icmp-type", None),
+    ("icmp", "code"): ("icmp-code", None),
+    ("icmpv6", "type"): ("icmpv6-type", None),
+    ("icmpv6", "code"): ("icmpv6-code", None),
+    ("meta", "iifname"): ("meta-iifname", None),
+    ("meta", "oifname"): ("meta-oifname", None),
+    ("meta", "iif"): ("meta-iifname", None),
+    ("meta", "oif"): ("meta-oifname", None),
+    ("meta", "iiftype"): ("meta-iiftype", None),
+    ("meta", "oiftype"): ("meta-oiftype", None),
+    ("meta", "l4proto"): ("meta-l4proto", None),
+    ("meta", "nfproto"): ("meta-nfproto", None),
+    ("meta", "mark"): ("meta-mark", None),
+    ("meta", "protocol"): ("meta-protocol", None),
+    ("meta", "skuid"): ("meta-skuid", None),
+    ("meta", "skgid"): ("meta-skgid", None),
+    ("meta", "cpu"): ("meta-cpu", None),
+    ("meta", "cgroup"): ("meta-cgroup", None),
+    ("meta", "time"): ("meta-time", None),
+    ("meta", "day"): ("meta-day", None),
+    ("meta", "hour"): ("meta-hour", None),
+    ("meta", "priority"): ("meta-priority", None),
+    ("ct", "state"): ("ct-state", None),
+    ("ct", "status"): ("ct-status", None),
+    ("ct", "direction"): ("ct-direction", None),
+    ("ct", "mark"): ("ct-mark", None),
+    ("ct", "helper"): ("ct-helper", None),
+    ("ct", "timeout"): ("ct-timeout", None),
+    ("ct", "label"): ("ct-label", None),
+    ("ct", "id"): ("ct-id", None),
+    ("iif", None): ("meta-iifname", None),
+    ("oif", None): ("meta-oifname", None),
+    ("iifname", None): ("meta-iifname", None),
+    ("oifname", None): ("meta-oifname", None),
+}
+
+
+class Parser:
+    def __init__(self, ctx):
+        self.ctx = ctx          # EvalContext (holds findings, model, etc.)
+        self.tables = {}        # (family, name) -> Table
+        self.order = 0          # merged-stream declaration order
+        self.unmodeled_commands = []  # (kind, family, table, chain, file, line)
+
+    def table(self, family, name, file, line):
+        key = (family, name)
+        if key not in self.tables:
+            self.tables[key] = Table(family, name, file, line)
+        return self.tables[key]
+
+    def parse(self, stmts):
+        for stmt in stmts:
+            self.parse_top(stmt)
+        return self.tables
+
+    def parse_top(self, stmt):
+        if not stmt:
+            return
+        kw = stmt[0].text
+        ctx = self.ctx
+        if kw == "table":
+            self.parse_table(stmt)
+        elif kw == "add":
+            self.parse_add(stmt)
+        elif kw == "flush":
+            self.parse_flush(stmt)
+        elif kw in ("delete", "insert", "replace", "rename", "list"):
+            self.record_unmodeled(stmt)
+        elif kw == "define" or kw == "include":
+            # handled by the loader; reaching here is a stream error
+            ctx.findings.append(Finding("unparseable",
+                "stray %s statement" % kw, stmt[0].file, stmt[0].line))
+        else:
+            ctx.findings.append(Finding(
+                "unparseable", "unrecognized top-level statement starting "
+                "with %r" % kw, stmt[0].file, stmt[0].line))
+
+    def record_unmodeled(self, stmt):
+        kw = stmt[0].text
+        fam = tbl = ch = None
+        toks = [t.text for t in stmt[1:]]
+        for i, t in enumerate(toks):
+            if t in FAMILIES and i + 1 < len(toks):
+                fam, tbl = t, toks[i + 1]
+                if i + 2 < len(toks):
+                    ch = toks[i + 2]
+                break
+        self.unmodeled_commands.append(
+            (kw, fam, tbl, ch, stmt[0].file, stmt[0].line))
+        self.ctx.findings.append(Finding(
+            "unmodeled-command",
+            "%s command is not modeled (NF02/NF29)" % kw,
+            stmt[0].file, stmt[0].line))
+
+    def parse_table(self, stmt):
+        # table FAMILY NAME { ... }
+        if len(stmt) < 4 or stmt[3].text != "{":
+            self.ctx.findings.append(Finding(
+                "unparseable", "malformed table declaration",
+                stmt[0].file, stmt[0].line))
+            return
+        family, name = stmt[1].text, stmt[2].text
+        if family not in FAMILIES:
+            self.ctx.findings.append(Finding(
+                "unparseable", "unknown table family %r" % family,
+                stmt[0].file, stmt[0].line))
+            return
+        inner, _rest = brace_body(stmt[3:])
+        if inner is None:
+            self.ctx.findings.append(Finding(
+                "unparseable", "unbalanced braces in table %s" % name,
+                stmt[0].file, stmt[0].line))
+            return
+        table = self.table(family, name, stmt[0].file, stmt[0].line)
+        for sub in split_statements(inner):
+            self.parse_table_body(sub, table)
+
+    def parse_table_body(self, stmt, table):
+        if not stmt:
+            return
+        kw = stmt[0].text
+        if kw == "chain":
+            self.parse_chain(stmt, table)
+        elif kw == "set":
+            self.parse_set(stmt, table)
+        elif kw == "map":
+            self.parse_map(stmt, table)
+        elif kw in ("counter", "quota", "limit"):
+            if len(stmt) >= 2:
+                table.objects[stmt[1].text] = (kw, stmt[0].file, stmt[0].line)
+        elif kw == "flowtable":
+            self.ctx.findings.append(Finding(
+                "unmodeled-command",
+                "flowtable %s is out of scope (NF05/Out-of-scope)"
+                % (stmt[1].text if len(stmt) > 1 else "?"),
+                stmt[0].file, stmt[0].line))
+        else:
+            self.ctx.findings.append(Finding(
+                "unparseable",
+                "unrecognized declaration %r inside table %s"
+                % (kw, table.name), stmt[0].file, stmt[0].line))
+
+    def parse_chain(self, stmt, table):
+        # chain NAME { type ... hook ... priority ...; policy ...; rules }
+        if len(stmt) < 3 or stmt[2].text != "{":
+            self.ctx.findings.append(Finding(
+                "unparseable", "malformed chain declaration",
+                stmt[0].file, stmt[0].line))
+            return
+        name = stmt[1].text
+        inner, _ = brace_body(stmt[2:])
+        if inner is None:
+            self.ctx.findings.append(Finding(
+                "unparseable", "unbalanced braces in chain %s" % name,
+                stmt[0].file, stmt[0].line))
+            return
+        chain = Chain(table, name, stmt[0].file, stmt[0].line)
+        self.order += 1
+        chain.stream_index = self.order
+        table.chains[name] = chain
+        body = split_statements(inner)
+        idx = 0
+        header_kw = {"type", "policy", "hook", "priority", "device",
+                     "comment", "flags"}
+        while idx < len(body) and body[idx] and body[idx][0].text in header_kw:
+            self.parse_chain_header(body[idx], chain)
+            idx += 1
+        for rule_stmt in body[idx:]:
+            rule = self.parse_rule(rule_stmt, chain)
+            chain.rules.append(rule)
+
+    def parse_chain_header(self, stmt, chain):
+        toks = stmt
+        i = 0
+        while i < len(toks):
+            kw = toks[i].text
+            if kw == "type" and i + 1 < len(toks):
+                chain.type = toks[i + 1].text
+                i += 2
+            elif kw == "hook" and i + 1 < len(toks):
+                chain.hook = toks[i + 1].text
+                i += 2
+            elif kw == "priority":
+                j = i + 1
+                expr = []
+                while j < len(toks) and toks[j].text not in (
+                        "type", "hook", "policy", "device", "comment",
+                        "flags"):
+                    expr.append(toks[j].text)
+                    j += 1
+                chain.priority_raw = " ".join(expr)
+                chain.priority = self.eval_priority(expr, chain)
+                i = j
+            elif kw == "policy" and i + 1 < len(toks):
+                chain.policy = toks[i + 1].text
+                chain.policy_line = toks[i + 1].line
+                i += 2
+            else:
+                i += 1
+
+    def eval_priority(self, expr, chain):
+        """Constant priority expression over keywords/integers (NF07)."""
+        if not expr:
+            return 0
+        kwmap = (BRIDGE_PRIORITY_KEYWORDS
+                 if chain.table.family == "bridge" else PRIORITY_KEYWORDS)
+        total = None
+        op = "+"
+        for tok in expr:
+            if tok in ("+", "-"):
+                op = tok
+                continue
+            if tok in kwmap:
+                val = kwmap[tok]
+            else:
+                val = parse_int(tok)
+                if val is None:
+                    chain.priority_poisoned = True
+                    self.ctx.findings.append(Finding(
+                        "priority-unknown",
+                        "non-constant priority expression %r on chain %s; "
+                        "ordering assumes 0" % (" ".join(expr), chain.name),
+                        chain.file, chain.line))
+                    return 0
+            if total is None:
+                total = val if op == "+" else -val
+            else:
+                total = total + val if op == "+" else total - val
+            op = "+"
+        return total if total is not None else 0
+
+    def parse_set(self, stmt, table):
+        if len(stmt) < 3 or stmt[2].text != "{":
+            self.ctx.findings.append(Finding(
+                "unparseable", "malformed set declaration",
+                stmt[0].file, stmt[0].line))
+            return
+        name = stmt[1].text
+        inner, _ = brace_body(stmt[2:])
+        if inner is None:
+            self.ctx.findings.append(Finding(
+                "unparseable", "unbalanced braces in set %s" % name,
+                stmt[0].file, stmt[0].line))
+            return
+        s = NamedSet(table, name, stmt[0].file, stmt[0].line)
+        table.sets[name] = s
+        for item in split_statements(inner):
+            if not item:
+                continue
+            kw = item[0].text
+            if kw == "type":
+                s.type = " ".join(t.text for t in item[1:])
+            elif kw == "flags":
+                for t in item[1:]:
+                    if t.text != ",":
+                        s.flags.add(t.text)
+            elif kw == "elements":
+                # elements = { ... }
+                eq = [i for i, t in enumerate(item) if t.text == "="]
+                if eq and eq[0] + 1 < len(item) and item[eq[0] + 1].text == "{":
+                    einner, _ = brace_body(item[eq[0] + 1:])
+                    if einner is None:
+                        s.poisoned = True
+                        s.poison_reason = "unbalanced elements list"
+                        continue
+                    for part in split_top_commas(einner):
+                        s.elements.append(parse_set_element(part, self.ctx))
+                else:
+                    s.poisoned = True
+                    s.poison_reason = "malformed elements list"
+            elif kw in ("timeout", "gc-interval", "size", "policy",
+                        "comment", "auto-merge"):
+                pass
+            else:
+                # NF29: an unparseable set declaration poisons that
+                # set's lookups (only that set's).
+                s.poisoned = True
+                s.poison_reason = ("unparseable set item %r" % kw)
+                self.ctx.findings.append(Finding(
+                    "unparseable", "unrecognized set item %r in set %s; "
+                    "lookups of this set are poisoned" % (kw, name),
+                    item[0].file, item[0].line))
+        self.check_set_interval(s)
+
+    def check_set_interval(self, s):
+        """NF17: range/prefix elements need flags interval."""
+        if "interval" in s.flags:
+            return
+        for el in s.elements:
+            if el.get("kind") in ("prefix", "range"):
+                s.poisoned = True
+                s.poison_reason = ("range/prefix elements without "
+                                   "flags interval (NF17)")
+                self.ctx.findings.append(Finding(
+                    "set-needs-interval",
+                    "set %s has range/prefix elements without flags "
+                    "interval; lookups poisoned" % s.name,
+                    s.file, s.line))
+                return
+            if el.get("kind") == "tuple":
+                for sub in el["values"]:
+                    if sub.get("kind") in ("prefix", "range"):
+                        s.poisoned = True
+                        s.poison_reason = ("range/prefix elements without "
+                                           "flags interval (NF17)")
+                        self.ctx.findings.append(Finding(
+                            "set-needs-interval",
+                            "set %s has range/prefix elements without "
+                            "flags interval; lookups poisoned" % s.name,
+                            s.file, s.line))
+                        return
+
+    def parse_map(self, stmt, table):
+        if len(stmt) < 3 or stmt[2].text != "{":
+            self.ctx.findings.append(Finding(
+                "unparseable", "malformed map declaration",
+                stmt[0].file, stmt[0].line))
+            return
+        name = stmt[1].text
+        inner, _ = brace_body(stmt[2:])
+        if inner is None:
+            self.ctx.findings.append(Finding(
+                "unparseable", "unbalanced braces in map %s" % name,
+                stmt[0].file, stmt[0].line))
+            return
+        m = NamedMap(table, name, stmt[0].file, stmt[0].line)
+        table.maps[name] = m
+        for item in split_statements(inner):
+            if not item:
+                continue
+            kw = item[0].text
+            if kw == "type":
+                rest = " ".join(t.text for t in item[1:])
+                if ":" in rest:
+                    kt, vt = rest.split(":", 1)
+                    m.key_type = kt.strip()
+                    m.value_type = vt.strip()
+                else:
+                    m.key_type = rest
+            elif kw == "flags":
+                for t in item[1:]:
+                    if t.text != ",":
+                        m.flags.add(t.text)
+            elif kw == "elements":
+                eq = [i for i, t in enumerate(item) if t.text == "="]
+                if eq and eq[0] + 1 < len(item) and item[eq[0] + 1].text == "{":
+                    einner, _ = brace_body(item[eq[0] + 1:])
+                    if einner is None:
+                        m.poisoned = True
+                        m.poison_reason = "unbalanced elements list"
+                        continue
+                    for part in split_top_commas(einner):
+                        # key : value
+                        colon = [i for i, t in enumerate(part)
+                                 if t.text == ":"]
+                        if not colon:
+                            m.poisoned = True
+                            m.poison_reason = "map element without ':'"
+                            continue
+                        ci = colon[0]
+                        key = parse_set_element(part[:ci], self.ctx)
+                        val = self.parse_map_value(part[ci + 1:])
+                        m.elements.append((key, val))
+                else:
+                    m.poisoned = True
+                    m.poison_reason = "malformed elements list"
+            elif kw in ("timeout", "gc-interval", "size", "policy",
+                        "comment", "auto-merge"):
+                pass
+            else:
+                m.poisoned = True
+                m.poison_reason = ("unparseable map item %r" % kw)
+                self.ctx.findings.append(Finding(
+                    "unparseable", "unrecognized map item %r in map %s; "
+                    "lookups of this map are poisoned" % (kw, name),
+                    item[0].file, item[0].line))
+        # duplicate identical keys are a load error in nft (NF19)
+        seen_keys = set()
+        for key, _val in m.elements:
+            ks = json.dumps(key, sort_keys=True, default=str)
+            if ks in seen_keys:
+                m.poisoned = True
+                m.poison_reason = "duplicate map key (NF19)"
+                self.ctx.findings.append(Finding(
+                    "load-would-fail",
+                    "map %s has a duplicate key; lookups poisoned" % m.name,
+                    m.file, m.line))
+                break
+            seen_keys.add(ks)
+
+    def parse_map_value(self, toks):
+        """A map value: verdict (accept/drop/jump X/...), or a literal."""
+        if not toks:
+            return {"kind": "lit", "text": ""}
+        kw = toks[0].text
+        if kw in ("accept", "drop", "reject", "queue", "continue", "return"):
+            st = {"kind": kw}
+            if kw == "reject":
+                st["reject_type"] = " ".join(t.text for t in toks[1:])
+            return {"kind": "verdict", "stmt": st}
+        if kw in ("jump", "goto"):
+            return {"kind": "verdict",
+                    "stmt": {"kind": kw,
+                             "target": toks[1].text if len(toks) > 1 else ""}}
+        val, _ = parse_value_tokens(toks, self.ctx)
+        return {"kind": "data", "value": val}
+
+    def parse_add(self, stmt):
+        # add table | add chain | add rule | add element | add set/map
+        if len(stmt) < 2:
+            return
+        sub = stmt[1].text
+        if sub == "table" and len(stmt) >= 4:
+            self.table(stmt[2].text, stmt[3].text, stmt[0].file, stmt[0].line)
+        elif sub == "chain":
+            self.parse_add_chain(stmt)
+        elif sub == "rule":
+            self.parse_add_rule(stmt)
+        elif sub == "element":
+            self.parse_add_element(stmt)
+        elif sub in ("set", "map") and len(stmt) >= 5:
+            fam, tname = stmt[2].text, stmt[3].text
+            table = self.table(fam, tname, stmt[0].file, stmt[0].line)
+            fake = [Token(sub, stmt[0].file, stmt[0].line)] + stmt[4:]
+            if sub == "set":
+                self.parse_set(fake, table)
+            else:
+                self.parse_map(fake, table)
+        elif sub in ("counter", "quota", "limit"):
+            pass
+        else:
+            self.ctx.findings.append(Finding(
+                "unparseable", "unrecognized add statement %r" % sub,
+                stmt[0].file, stmt[0].line))
+
+    def parse_add_chain(self, stmt):
+        # add chain FAMILY TABLE NAME [ { ... } ]
+        if len(stmt) < 5:
+            return
+        fam, tname, cname = stmt[2].text, stmt[3].text, stmt[4].text
+        table = self.table(fam, tname, stmt[0].file, stmt[0].line)
+        chain = Chain(table, cname, stmt[0].file, stmt[0].line)
+        self.order += 1
+        chain.stream_index = self.order
+        table.chains[cname] = chain
+        if len(stmt) > 5 and stmt[5].text == "{":
+            inner, _ = brace_body(stmt[5:])
+            if inner is None:
+                return
+            body = split_statements(inner)
+            idx = 0
+            header_kw = {"type", "policy", "hook", "priority", "device",
+                         "comment", "flags"}
+            while idx < len(body) and body[idx] and body[idx][0].text in header_kw:
+                self.parse_chain_header(body[idx], chain)
+                idx += 1
+            for rule_stmt in body[idx:]:
+                chain.rules.append(self.parse_rule(rule_stmt, chain))
+
+    def parse_add_rule(self, stmt):
+        # add rule FAMILY TABLE CHAIN <rule tokens>
+        if len(stmt) < 6:
+            self.ctx.findings.append(Finding(
+                "unparseable", "malformed add rule statement",
+                stmt[0].file, stmt[0].line))
+            return
+        fam, tname, cname = stmt[2].text, stmt[3].text, stmt[4].text
+        table = self.table(fam, tname, stmt[0].file, stmt[0].line)
+        chain = table.chains.get(cname)
+        if chain is None:
+            chain = Chain(table, cname, stmt[0].file, stmt[0].line)
+            self.order += 1
+            chain.stream_index = self.order
+            table.chains[cname] = chain
+            self.ctx.findings.append(Finding(
+                "load-would-fail",
+                "add rule targets undeclared chain %s (nft would reject "
+                "it)" % cname, stmt[0].file, stmt[0].line))
+        chain.rules.append(self.parse_rule(stmt[5:], chain))
+
+    def parse_add_element(self, stmt):
+        # add element FAMILY TABLE SET { e1, e2, ... }
+        if len(stmt) < 6:
+            return
+        fam, tname, sname = stmt[2].text, stmt[3].text, stmt[4].text
+        table = self.table(fam, tname, stmt[0].file, stmt[0].line)
+        if len(stmt) > 5 and stmt[5].text == "{":
+            inner, _ = brace_body(stmt[5:])
+            if inner is None:
+                return
+            target = table.sets.get(sname) or table.maps.get(sname)
+            if target is None:
+                self.ctx.findings.append(Finding(
+                    "load-would-fail",
+                    "add element targets undeclared set/map %s" % sname,
+                    stmt[0].file, stmt[0].line))
+                return
+            if isinstance(target, NamedSet):
+                for part in split_top_commas(inner):
+                    target.elements.append(parse_set_element(part, self.ctx))
+                self.check_set_interval(target)
+            else:
+                for part in split_top_commas(inner):
+                    colon = [i for i, t in enumerate(part) if t.text == ":"]
+                    if not colon:
+                        continue
+                    ci = colon[0]
+                    key = parse_set_element(part[:ci], self.ctx)
+                    val = self.parse_map_value(part[ci + 1:])
+                    target.elements.append((key, val))
+
+    def parse_flush(self, stmt):
+        if len(stmt) >= 2 and stmt[1].text == "ruleset":
+            self.tables = {}
+            self.ctx.findings.append(Finding(
+                "info", "flush ruleset discarded all objects modeled so far",
+                stmt[0].file, stmt[0].line))
+        elif len(stmt) >= 4 and stmt[1].text == "table":
+            key = (stmt[2].text, stmt[3].text)
+            self.tables.pop(key, None)
+        elif len(stmt) >= 5 and stmt[1].text == "chain":
+            tbl = self.tables.get((stmt[2].text, stmt[3].text))
+            if tbl is not None:
+                tbl.chains.pop(stmt[4].text, None)
+        elif len(stmt) >= 5 and stmt[1].text == "set":
+            tbl = self.tables.get((stmt[2].text, stmt[3].text))
+            if tbl is not None and stmt[4].text in tbl.sets:
+                tbl.sets[stmt[4].text].elements = []
+        else:
+            self.ctx.findings.append(Finding(
+                "unparseable", "unrecognized flush statement",
+                stmt[0].file, stmt[0].line))
+
+    # -- rule parsing -------------------------------------------------
+
+    def parse_rule(self, toks, chain):
+        rule = Rule(chain, toks[0].file if toks else chain.file,
+                    toks[0].line if toks else chain.line)
+        rule.text = " ".join(t.text for t in toks)
+        if not toks:
+            return rule
+        pos = 0
+        seen_stmt = False
+        while pos < len(toks):
+            tok = toks[pos]
+            if tok.text.startswith("__UNDEFINED_DEFINE__"):
+                name = tok.text.split(":", 1)[1]
+                rule.unparseable = True
+                rule.unparseable_reason = "undefined-define"
+                self.ctx.findings.append(Finding(
+                    "undefined-define", "use of undefined define $%s" % name,
+                    tok.file, tok.line))
+                return rule
+            # meta/ct ... set ... is a statement in any position (NF23)
+            if tok.text in ("meta", "ct") and not tok.quoted:
+                nxt = toks[pos + 1].text if pos + 1 < len(toks) else ""
+                after = toks[pos + 2].text if pos + 2 < len(toks) else ""
+                if nxt in ("mark", "priority", "label") and after == "set":
+                    stmt, pos = self.parse_statement(toks, pos, rule)
+                    if stmt:
+                        rule.statements.append(stmt)
+                    seen_stmt = True
+                    continue
+            # limit/quota/meter after a match is a statement (NF24:
+            # the match-vs-statement position distinction); as the
+            # first match it is a rate-shaped match.
+            if tok.text in ("limit", "quota", "meter") and rule.matches:
+                stmt, pos = self.parse_statement(toks, pos, rule)
+                if stmt:
+                    rule.statements.append(stmt)
+                seen_stmt = True
+                continue
+            if not seen_stmt and tok.text in FIELD_STARTS and not tok.quoted:
+                expr, pos = self.parse_match(toks, pos, rule)
+                if expr is not None:
+                    if expr.get("kind") == "vmap-stmt":
+                        rule.statements.append(expr["stmt"])
+                        seen_stmt = True
+                    else:
+                        rule.matches.append(expr)
+                continue
+            if tok.text in STATEMENT_KEYWORDS and not tok.quoted:
+                stmt, pos = self.parse_statement(toks, pos, rule)
+                if stmt:
+                    rule.statements.append(stmt)
+                seen_stmt = True
+                continue
+            # A field followed by 'vmap' is a verdict-map statement, and
+            # a bare field name (iif/oif) starts a match even after a
+            # statement only in the vmap form; anything else here is
+            # unclassifiable (NF29).
+            rule.unparseable = True
+            rule.unparseable_reason = "unrecognized token %r" % tok.text
+            self.ctx.findings.append(Finding(
+                "unparseable",
+                "rule in chain %s has unrecognized token %r; rule poisons "
+                "its chain from here (NF29)" % (chain.name, tok.text),
+                tok.file, tok.line))
+            return rule
+        return rule
+
+    def parse_field_spec(self, toks, pos):
+        """Parse FIELD [. FIELD]* at pos. Returns (field list, new pos)
+        where each entry is (canonical, family, raw) or None if the
+        field is unknown (still consumes the tokens)."""
+        fields = []
+        while True:
+            if pos >= len(toks):
+                break
+            t0 = toks[pos]
+            if t0.text in ("iif", "oif", "iifname", "oifname"):
+                canon = FIELD_TABLE[(t0.text, None)]
+                fields.append((canon[0], canon[1], t0.text))
+                pos += 1
+            elif pos + 1 < len(toks) and (t0.text, toks[pos + 1].text) in FIELD_TABLE:
+                canon = FIELD_TABLE[(t0.text, toks[pos + 1].text)]
+                fields.append((canon[0], canon[1],
+                               t0.text + " " + toks[pos + 1].text))
+                pos += 2
+            elif t0.text in ("ip", "ip6", "tcp", "udp", "sctp", "icmp",
+                             "icmpv6", "th", "meta", "ct"):
+                # known prefix, unknown subfield: consume both, flag it
+                sub = toks[pos + 1].text if pos + 1 < len(toks) else "?"
+                fields.append((t0.text + " " + sub, None,
+                               t0.text + " " + sub))
+                pos += 2
+            else:
+                break
+            if pos < len(toks) and toks[pos].text == ".":
+                pos += 1
+                continue
+            break
+        return fields, pos
+
+    def parse_match(self, toks, pos, rule):
+        """Parse one match expression starting at a field keyword.
+        Returns (expr dict, new pos). May return a vmap statement
+        instead (kind 'vmap-stmt' marker handled by caller via expr)."""
+        start = toks[pos]
+        # fib / hash / socket / payload / xt / limit / quota / meter:
+        # whole-expression UNKNOWN kinds (NF24/NF25).
+        kw = start.text
+        if kw == "fib":
+            end = pos + 1
+            while end < len(toks) and toks[end].text not in STATEMENT_KEYWORDS \
+                    and toks[end].text not in ("accept", "drop", "reject",
+                                               "queue", "continue", "return",
+                                               "jump", "goto"):
+                end += 1
+            # fib expr is 'fib <addr> [. <if>] type <types>'; stop before
+            # a following real match field if one is recognizable after
+            # the 'type' values.
+            return ({"kind": "poison", "code": "routing-dependent",
+                     "message": "fib lookup depends on the kernel routing "
+                     "table, not this file (NF25)",
+                     "file": start.file, "line": start.line}, end)
+        if kw in ("jhash", "symhash", "numgen", "hash"):
+            end = pos + 1
+            while end < len(toks) and toks[end].text not in STATEMENT_KEYWORDS:
+                end += 1
+            return ({"kind": "poison", "code": "hash-or-random",
+                     "message": "%s is a runtime hash/random expression "
+                     "(NF25)" % kw, "file": start.file,
+                     "line": start.line}, end)
+        if kw == "socket":
+            end = pos + 1
+            while end < len(toks) and toks[end].text not in STATEMENT_KEYWORDS:
+                end += 1
+            return ({"kind": "poison", "code": "process-context",
+                     "message": "socket match depends on process context "
+                     "(NF25)", "file": start.file, "line": start.line}, end)
+        if kw == "xt":
+            end = pos + 1
+            while end < len(toks) and toks[end].text not in STATEMENT_KEYWORDS:
+                end += 1
+            return ({"kind": "poison", "code": "unmodeled-field",
+                     "message": "xtables-compat match is out of scope "
+                     "(NF25)", "file": start.file, "line": start.line}, end)
+        if kw in ("limit", "quota"):
+            # match position: rate-shaped match, runtime fact (NF24)
+            end = pos + 1
+            while end < len(toks) and toks[end].text not in STATEMENT_KEYWORDS \
+                    and toks[end].text not in FIELD_STARTS:
+                end += 1
+            return ({"kind": "poison", "code": "rate-dependent",
+                     "message": "%s as a match depends on traffic already "
+                     "passed (NF24)" % kw, "file": start.file,
+                     "line": start.line}, end)
+        if kw == "meter":
+            end = pos + 1
+            depth = 0
+            while end < len(toks):
+                if toks[end].text == "{":
+                    depth += 1
+                elif toks[end].text == "}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif depth == 0 and toks[end].text in STATEMENT_KEYWORDS:
+                    break
+                end += 1
+            return ({"kind": "poison", "code": "rate-dependent",
+                     "message": "meter match depends on traffic already "
+                     "passed (NF24)", "file": start.file,
+                     "line": start.line}, end)
+        if kw in ("ether", "vlan", "arp"):
+            end = pos + 1
+            while end < len(toks) and toks[end].text not in STATEMENT_KEYWORDS \
+                    and toks[end].text not in FIELD_STARTS:
+                end += 1
+            return ({"kind": "poison", "code": "unmodeled-field",
+                     "message": "%s header fields are out of the v1 surface "
+                     "(NF14)" % kw, "file": start.file,
+                     "line": start.line}, end)
+        if kw.startswith("@"):
+            # raw payload expression @nh/@th/@ll/@ct
+            end = pos + 1
+            while end < len(toks) and toks[end].text not in STATEMENT_KEYWORDS \
+                    and toks[end].text not in FIELD_STARTS:
+                end += 1
+            return ({"kind": "poison", "code": "unmodeled-field",
+                     "message": "raw payload expression is out of the v1 "
+                     "surface (NF14/NF25)", "file": start.file,
+                     "line": start.line}, end)
+        if kw in ("ct",) and pos + 1 < len(toks) and toks[pos + 1].text in (
+                "helper", "timeout", "original", "reply", "expectation",
+                "id", "label"):
+            sub = toks[pos + 1].text
+            end = pos + 2
+            while end < len(toks) and toks[end].text not in STATEMENT_KEYWORDS \
+                    and toks[end].text not in FIELD_STARTS:
+                end += 1
+            return ({"kind": "poison", "code": "unmodeled-field",
+                     "message": "ct %s is outside the modeled ct subset "
+                     "(NF21)" % sub, "file": start.file,
+                     "line": start.line}, end)
+
+        fields, pos = self.parse_field_spec(toks, pos)
+        if not fields:
+            return ({"kind": "poison", "code": "unparseable",
+                     "message": "unrecognized match field",
+                     "file": start.file, "line": start.line}, pos + 1)
+        # FIELD vmap ... is a statement, not a match (NF19)
+        if pos < len(toks) and toks[pos].text == "vmap":
+            stmt, npos = self.parse_vmap(toks, pos, fields, start)
+            return ({"kind": "vmap-stmt", "stmt": stmt}, npos)
+        # optional negation / mask
+        neg = False
+        if pos < len(toks) and toks[pos].text == "!":
+            neg = True
+            pos += 1
+        mask = None
+        if pos < len(toks) and toks[pos].text == "&":
+            pos += 1
+            if pos < len(toks):
+                mask = toks[pos].text
+                pos += 1
+                if pos < len(toks) and toks[pos].text == "{":
+                    _inner, rest = brace_body(toks[pos:])
+                    mask = "{" + " ".join(t.text for t in (_inner or [])) + "}"
+                    pos = len(toks) - len(rest)
+        op = "=="
+        if pos < len(toks) and toks[pos].text in (
+                "==", "!=", ">=", "<=", ">", "<"):
+            op = toks[pos].text
+            pos += 1
+        if op == "!=":
+            neg = not neg
+            op = "=="
+        # value, possibly 'a-b' range as three tokens, possibly @named
+        if pos < len(toks) and toks[pos].text == "!":
+            neg = not neg
+            pos += 1
+        value, pos = self.parse_match_value(toks, pos, fields)
+        return ({"kind": "match", "fields": fields, "op": op, "neg": neg,
+                 "mask": mask, "value": value,
+                 "file": start.file, "line": start.line}, pos)
+
+    def parse_match_value(self, toks, pos, fields):
+        """Parse the value after a field (and optional op). Handles
+        three-token ranges (VAL - VAL) and comma lists."""
+        if pos >= len(toks):
+            return v_unknown("unparseable", "missing match value"), pos
+        tok = toks[pos]
+        if tok.text.startswith("__UNDEFINED_DEFINE__"):
+            name = tok.text.split(":", 1)[1]
+            self.ctx.findings.append(Finding(
+                "undefined-define", "use of undefined define $%s" % name,
+                tok.file, tok.line))
+            return v_unknown("undefined-define",
+                             "undefined define $%s" % name), pos + 1
+        if tok.text == "{":
+            inner, rest = brace_body(toks[pos:])
+            if inner is None:
+                return v_unknown("unparseable", "unbalanced {"), pos + 1
+            elems = []
+            for part in split_top_commas(inner):
+                elems.append(parse_set_element(part, self.ctx))
+            return {"kind": "setlit", "elements": elems}, len(toks) - len(rest)
+        if tok.text.startswith("@"):
+            return {"kind": "named", "name": tok.text[1:]}, pos + 1
+        # three-token range: VAL - VAL
+        if pos + 2 < len(toks) and toks[pos + 1].text == "-":
+            lo = tok.text
+            hi = toks[pos + 2].text
+            rng = parse_range_token(lo + "-" + hi)
+            if rng is not None:
+                return {"kind": "range", "rtype": rng[0], "lo": rng[1],
+                        "hi": rng[2]}, pos + 3
+        first, _ = parse_single_value(tok, self.ctx)
+        pos += 1
+        if pos < len(toks) and toks[pos].text == ",":
+            vals = [first]
+            pos += 1
+            while pos < len(toks):
+                v, _ = parse_single_value(toks[pos], self.ctx)
+                vals.append(v)
+                pos += 1
+                if pos < len(toks) and toks[pos].text == ",":
+                    pos += 1
+                    continue
+                break
+            return {"kind": "list", "values": vals}, pos
+        return first, pos
+
+    def parse_vmap(self, toks, pos, fields, start):
+        """toks[pos] == 'vmap'. Returns (stmt, new pos)."""
+        pos += 1  # skip vmap
+        if pos < len(toks) and toks[pos].text.startswith("@"):
+            return ({"kind": "vmap", "fields": fields,
+                     "map": toks[pos].text[1:], "file": start.file,
+                     "line": start.line}, pos + 1)
+        if pos < len(toks) and toks[pos].text == "{":
+            inner, rest = brace_body(toks[pos:])
+            if inner is None:
+                return ({"kind": "vmap", "fields": fields, "entries": [],
+                         "broken": True, "file": start.file,
+                         "line": start.line}, pos + 1)
+            entries = []
+            for part in split_top_commas(inner):
+                colon = [i for i, t in enumerate(part) if t.text == ":"]
+                if not colon:
+                    continue
+                ci = colon[0]
+                key = parse_set_element(part[:ci], self.ctx)
+                val = self.parse_map_value(part[ci + 1:])
+                entries.append((key, val))
+            return ({"kind": "vmap", "fields": fields, "entries": entries,
+                     "file": start.file, "line": start.line},
+                    len(toks) - len(rest))
+        return ({"kind": "vmap", "fields": fields, "entries": [],
+                 "broken": True, "file": start.file,
+                 "line": start.line}, pos)
+
+    def parse_statement(self, toks, pos, rule):
+        """Parse one statement starting at pos. Returns (stmt, new pos)."""
+        start = toks[pos]
+        kw = start.text
+        if kw in ("accept", "drop", "continue", "return"):
+            return {"kind": kw, "file": start.file, "line": start.line}, pos + 1
+        if kw == "reject":
+            # reject [with TYPE]: TYPE may be 'tcp reset' or
+            # 'icmp type <name>' / 'icmpv6 type <name>' — parse the
+            # shape structurally instead of scanning for a statement
+            # keyword, because 'icmp'/'tcp' are field-start words.
+            end = pos + 1
+            rest = []
+            if end < len(toks) and toks[end].text == "with":
+                end += 1
+                while end < len(toks) and toks[end].text not in \
+                        STATEMENT_KEYWORDS:
+                    rest.append(toks[end].text)
+                    end += 1
+                    if rest and rest[-1] in ("reset",):
+                        break
+                    if len(rest) >= 3 and rest[0] in ("icmp", "icmpv6"):
+                        break
+                    if len(rest) >= 4:
+                        break
+            return ({"kind": "reject",
+                     "reject_type": " ".join(rest),
+                     "file": start.file, "line": start.line}, end)
+        if kw == "queue":
+            end = pos + 1
+            while end < len(toks) and toks[end].text not in STATEMENT_KEYWORDS \
+                    and toks[end].text not in FIELD_STARTS:
+                end += 1
+            return ({"kind": "queue", "file": start.file,
+                     "line": start.line}, end)
+        if kw in ("jump", "goto"):
+            target = toks[pos + 1].text if pos + 1 < len(toks) else ""
+            return ({"kind": kw, "target": target, "file": start.file,
+                     "line": start.line}, pos + 2)
+        if kw in ("log", "counter", "dup", "fwd", "synproxy", "notrack",
+                  "limit", "quota", "meter", "flow", "reroute", "update"):
+            end = pos + 1
+            depth = 0
+            while end < len(toks):
+                t = toks[end].text
+                if t == "{":
+                    depth += 1
+                elif t == "}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif depth == 0 and (t in STATEMENT_KEYWORDS
+                                     or t in FIELD_STARTS):
+                    break
+                end += 1
+            if kw == "notrack":
+                return ({"kind": "notrack", "file": start.file,
+                         "line": start.line}, end)
+            if kw == "flow":
+                return ({"kind": "flow", "file": start.file,
+                         "line": start.line}, end)
+            if kw == "reroute":
+                return ({"kind": "reroute", "file": start.file,
+                         "line": start.line}, end)
+            return ({"kind": "stmt-" + kw, "args": [t.text for t in toks[pos + 1:end]],
+                     "file": start.file, "line": start.line}, end)
+        if kw in ("meta", "ct"):
+            # meta mark set VALUE [map @NAME] | ct mark set ... |
+            # meta priority set ... | ct label set ...
+            if pos + 2 < len(toks) and toks[pos + 2].text == "set":
+                which = toks[pos + 1].text
+                end = pos + 3
+                depth = 0
+                # The value may itself be a field reference ('meta mark
+                # set ct mark'), so stop only at statement keywords,
+                # never at a field-start token.
+                while end < len(toks):
+                    t = toks[end].text
+                    if t == "{":
+                        depth += 1
+                    elif t == "}":
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    elif depth == 0 and t in STATEMENT_KEYWORDS:
+                        break
+                    end += 1
+                val_toks = toks[pos + 3:end]
+                kind = {"mark": "mark-set", "priority": "mark-set",
+                        "label": "mark-set"}.get(which, "mark-set")
+                if kw == "ct" and which == "mark":
+                    kind = "ctmark-set"
+                elif kw == "meta" and which == "mark":
+                    kind = "mark-set"
+                else:
+                    # meta priority set / ct label set: tracked as a
+                    # finding only (NF23) — no v1 field reads them.
+                    return ({"kind": "stmt-" + kw, "args": [],
+                             "file": start.file, "line": start.line}, end)
+                return ({"kind": kind, "value_toks": val_toks,
+                         "file": start.file, "line": start.line}, end)
+            # 'meta ...' as a statement that is not a set: unclassifiable
+            rule.unparseable = True
+            rule.unparseable_reason = "unrecognized meta statement"
+            self.ctx.findings.append(Finding(
+                "unparseable", "unrecognized meta/ct statement in chain %s"
+                % rule.chain.name, start.file, start.line))
+            return None, len(toks)
+        if kw in ("masquerade", "redirect"):
+            end = pos + 1
+            target = None
+            if end < len(toks) and toks[end].text == "to":
+                end += 1
+                tgt = []
+                while end < len(toks) and toks[end].text not in STATEMENT_KEYWORDS \
+                        and toks[end].text not in FIELD_STARTS:
+                    tgt.append(toks[end])
+                    end += 1
+                target = " ".join(t.text for t in tgt) if tgt else None
+            return ({"kind": "nat", "nat_kind": kw, "target": target,
+                     "file": start.file, "line": start.line}, end)
+        if kw in ("snat", "dnat"):
+            end = pos + 1
+            target = None
+            mapref = None
+            keyfield = None
+            if end < len(toks) and toks[end].text == "to":
+                end += 1
+                # forms: ADDR | ADDR:PORT | FIELD map @NAME | FIELD
+                if end < len(toks) and toks[end].text in FIELD_STARTS:
+                    fields, end = self.parse_field_spec(toks, end)
+                    keyfield = fields
+                    if end < len(toks) and toks[end].text == "map":
+                        end += 1
+                        if end < len(toks) and toks[end].text.startswith("@"):
+                            mapref = toks[end].text[1:]
+                            end += 1
+                else:
+                    tgt = []
+                    while end < len(toks) and toks[end].text not in STATEMENT_KEYWORDS \
+                            and toks[end].text not in FIELD_STARTS:
+                        tgt.append(toks[end])
+                        end += 1
+                    target = " ".join(t.text for t in tgt) if tgt else None
+            return ({"kind": "nat", "nat_kind": kw, "target": target,
+                     "map": mapref, "keyfield": keyfield,
+                     "file": start.file, "line": start.line}, end)
+        if kw == "tproxy":
+            end = pos + 1
+            while end < len(toks) and toks[end].text not in STATEMENT_KEYWORDS \
+                    and toks[end].text not in FIELD_STARTS:
+                end += 1
+            return ({"kind": "nat", "nat_kind": "tproxy",
+                     "target": " ".join(t.text for t in toks[pos + 1:end]),
+                     "file": start.file, "line": start.line}, end)
+        # Unknown statement keyword: the rule's execution is
+        # UNKNOWN-if-matched (NF29).
+        rule.unparseable = True
+        rule.unparseable_reason = "unrecognized statement %r" % kw
+        self.ctx.findings.append(Finding(
+            "unparseable",
+            "rule in chain %s has unrecognized statement %r; execution "
+            "UNKNOWN-if-matched (NF29)" % (rule.chain.name, kw),
+            start.file, start.line))
+        return None, len(toks)
+
+# ---------------------------------------------------------------- evaluation
+
+class Packet:
+    def __init__(self, family=None, saddr=None, daddr=None, proto=None,
+                 sport=None, dport=None, iif=None, oif=None, ctstate=None,
+                 mark=None, tcpflags=None, icmptype=None, icmpcode=None,
+                 in_iface_addrs=None):
+        self.family = family
+        self.saddr = saddr      # ipaddress object or None
+        self.daddr = daddr
+        self.proto = proto      # int or None
+        self.sport = sport
+        self.dport = dport
+        self.iif = iif
+        self.oif = oif
+        self.ctstate = set(ctstate or [])
+        self.mark = mark
+        self.tcpflags = tcpflags    # int bitmask or None
+        self.icmptype = icmptype
+        self.icmpcode = icmpcode
+        self.in_iface_addrs = list(in_iface_addrs or [])
+
+
+class EvalContext:
+    def __init__(self, tables, packet, services=None):
+        self.tables = tables
+        self.packet = packet
+        self.services = services or {}   # name -> port
+        self.findings = []
+        self.sets_consulted = []    # (table, set name, file, line)
+        self.maps_consulted = []
+        self.defines_expanded = []
+        self.meta_mark = packet.mark     # NF23 mutable state
+        self.ct_mark = None
+        self.ctstate = set(packet.ctstate)
+        self.fields_read = set()        # canonical fields read so far
+
+    def note_finding(self, code, message, file=None, line=None):
+        self.findings.append(Finding(code, message, file, line))
+
+
+def _ip_int(addr):
+    return int(addr) if addr is not None else None
+
+
+def value_matches_scalar(spec, pkt_value, pkt_family, ctx, field):
+    """Compare one packet scalar against one value spec.
+    pkt_value: int (port/proto/mark), ipaddress, str (name), or None
+    (unknown). Returns Tri."""
+    kind = spec.get("kind")
+    if kind == "unknown":
+        ctx.note_finding(spec["code"], spec["message"])
+        return Tri.UNKNOWN
+    if kind == "hostname":
+        ctx.note_finding("load-time-dns",
+                         "hostname %r is resolved by nft at load time via "
+                         "DNS; the file does not contain the answer (NF26)"
+                         % spec["text"])
+        return Tri.UNKNOWN
+    if kind == "named":
+        return Tri.UNKNOWN  # caller resolves named sets; bare here = error
+    if kind == "setlit":
+        results = [value_matches_scalar(e, pkt_value, pkt_family, ctx, field)
+                   for e in spec["elements"]]
+        if Tri.TRUE in results:
+            return Tri.TRUE
+        if Tri.UNKNOWN in results:
+            return Tri.UNKNOWN
+        return Tri.FALSE
+    if kind == "list":
+        results = [value_matches_scalar(v, pkt_value, pkt_family, ctx, field)
+                   for v in spec["values"]]
+        if Tri.TRUE in results:
+            return Tri.TRUE
+        if Tri.UNKNOWN in results:
+            return Tri.UNKNOWN
+        return Tri.FALSE
+    if kind == "tuple":
+        return Tri.UNKNOWN
+    if kind == "prefix":
+        if pkt_value is None:
+            return Tri.UNKNOWN
+        try:
+            return Tri.TRUE if pkt_value in spec["network"] else Tri.FALSE
+        except TypeError:
+            return Tri.FALSE
+    if kind == "range":
+        if pkt_value is None:
+            return Tri.UNKNOWN
+        v = _ip_int(pkt_value) if not isinstance(pkt_value, int) else pkt_value
+        return Tri.TRUE if spec["lo"] <= v <= spec["hi"] else Tri.FALSE
+    # lit
+    text = spec["text"]
+    if pkt_value is None:
+        return Tri.UNKNOWN
+    if isinstance(pkt_value, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        if looks_like_ip(text):
+            try:
+                return Tri.TRUE if pkt_value == ipaddress.ip_address(text) \
+                    else Tri.FALSE
+            except ValueError:
+                return Tri.FALSE
+        return Tri.UNKNOWN
+    if isinstance(pkt_value, int):
+        n = parse_int(text)
+        if n is not None:
+            return Tri.TRUE if pkt_value == n else Tri.FALSE
+        # symbolic protocol / flag / icmp-type name
+        if field in ("meta-l4proto", "ip-protocol", "ip6-nexthdr"):
+            p = PROTOCOLS.get(text.lower())
+            if p is not None:
+                return Tri.TRUE if pkt_value == p else Tri.FALSE
+            return Tri.UNKNOWN
+        if field == "tcp-flags":
+            bit = TCP_FLAG_BITS.get(text.lower())
+            if bit is not None:
+                return Tri.TRUE if (pkt_value & bit) else Tri.FALSE
+            return Tri.UNKNOWN
+        if field in ("icmp-type",):
+            t = ICMP_TYPES.get(text.lower())
+            if t is not None:
+                return Tri.TRUE if pkt_value == t else Tri.FALSE
+            return Tri.UNKNOWN
+        if field in ("icmpv6-type",):
+            t = ICMPV6_TYPES.get(text.lower())
+            if t is not None:
+                return Tri.TRUE if pkt_value == t else Tri.FALSE
+            return Tri.UNKNOWN
+        if field in ("ct-state",):
+            return Tri.TRUE if text.lower() in _ct_state_names(pkt_value) \
+                else Tri.FALSE
+        return Tri.UNKNOWN
+    if isinstance(pkt_value, str):
+        return Tri.TRUE if pkt_value == text else Tri.FALSE
+    return Tri.UNKNOWN
+
+
+def _ct_state_names(state_int):
+    return set()
+
+
+def eval_field_value(field, pkt, ctx):
+    """Packet value for one canonical field, or None if unknown.
+    Returns (value, family_gate) where family_gate is Tri.FALSE when
+    the field cannot exist for this packet family (NF15)."""
+    fam = pkt.family
+    if field == "ip-saddr":
+        if fam == "ipv6":
+            return None, Tri.FALSE
+        return pkt.saddr, None
+    if field == "ip-daddr":
+        if fam == "ipv6":
+            return None, Tri.FALSE
+        return pkt.daddr, None
+    if field == "ip6-saddr":
+        if fam == "ipv4":
+            return None, Tri.FALSE
+        return pkt.saddr, None
+    if field == "ip6-daddr":
+        if fam == "ipv4":
+            return None, Tri.FALSE
+        return pkt.daddr, None
+    if field == "meta-iifname":
+        return pkt.iif, None
+    if field == "meta-oifname":
+        return pkt.oif, None
+    if field == "meta-nfproto":
+        if fam is None:
+            return None, None
+        return fam, None
+    if field in ("meta-l4proto", "ip-protocol", "ip6-nexthdr"):
+        return pkt.proto, None
+    if field == "meta-mark":
+        return ctx.meta_mark, None
+    if field == "ct-mark":
+        return ctx.ct_mark, None
+    if field == "meta-protocol":
+        if fam == "ipv4":
+            return 0x0800, None
+        if fam == "ipv6":
+            return 0x86DD, None
+        return None, None
+    if field in ("tcp-sport", "th-sport"):
+        if field == "tcp-sport" and pkt.proto is not None \
+                and pkt.proto != 6:
+            return None, Tri.FALSE
+        if field == "th-sport" and pkt.proto is not None \
+                and pkt.proto not in (6, 17, 132):
+            return None, Tri.FALSE
+        return pkt.sport, None
+    if field in ("tcp-dport", "th-dport"):
+        if field == "tcp-dport" and pkt.proto is not None \
+                and pkt.proto != 6:
+            return None, Tri.FALSE
+        if field == "th-dport" and pkt.proto is not None \
+                and pkt.proto not in (6, 17, 132):
+            return None, Tri.FALSE
+        return pkt.dport, None
+    if field in ("udp-sport", "sctp-sport"):
+        proto = 17 if field.startswith("udp") else 132
+        if pkt.proto is not None and pkt.proto != proto:
+            return None, Tri.FALSE
+        return pkt.sport, None
+    if field in ("udp-dport", "sctp-dport"):
+        proto = 17 if field.startswith("udp") else 132
+        if pkt.proto is not None and pkt.proto != proto:
+            return None, Tri.FALSE
+        return pkt.dport, None
+    if field == "tcp-flags":
+        return pkt.tcpflags, None
+    if field == "icmp-type":
+        if pkt.proto is not None and pkt.proto != 1:
+            return None, Tri.FALSE
+        return pkt.icmptype, None
+    if field == "icmpv6-type":
+        if pkt.proto is not None and pkt.proto != 58:
+            return None, Tri.FALSE
+        return pkt.icmptype, None
+    if field in ("icmp-code", "icmpv6-code"):
+        if pkt.proto is not None and pkt.proto not in (1, 58):
+            return None, Tri.FALSE
+        return pkt.icmpcode, None
+    if field == "ct-state":
+        return pkt.ctstate if pkt.ctstate else None, None
+    # modeled-but-unsupplied numeric fields: UNKNOWN, never defaulted
+    if field in ("ip-length", "ip-ttl", "ip-dscp", "ip6-flowlabel",
+                 "meta-iiftype", "meta-oiftype", "ct-status",
+                 "ct-direction"):
+        return None, None
+    return None, None
+
+
+def resolve_service(name, ctx):
+    """NF26 hermetic service resolution: only the --services file."""
+    if name in ctx.services:
+        return ctx.services[name]
+    ctx.note_finding("symbolic-service",
+                     "service name %r resolves only from a --services file; "
+                     "none supplied (or name absent) — hermetic, no host "
+                     "lookup (NF26)" % name)
+    return None
+
+
+def eval_match_expr(expr, pkt, ctx, chain):
+    """Evaluate one match expression -> Tri. Records fields read."""
+    if expr["kind"] == "poison":
+        ctx.note_finding(expr["code"], expr["message"],
+                         expr.get("file"), expr.get("line"))
+        return Tri.UNKNOWN
+    fields = expr["fields"]
+    value = expr["value"]
+    op = expr.get("op", "==")
+    neg = expr.get("neg", False)
+    mask = expr.get("mask")
+
+    # service-name values on port fields (NF26)
+    value = _maybe_resolve_service(value, fields, ctx)
+
+    if len(fields) == 1:
+        canon, fam, _raw = fields[0]
+        result = eval_single_field(canon, value, op, mask, pkt, ctx, chain)
+    else:
+        # concatenation (NF20): tuple element-wise
+        result = eval_concat(fields, value, op, pkt, ctx, chain)
+    if neg:
+        result = tri_not(result)
+    return result
+
+
+def _maybe_resolve_service(value, fields, ctx):
+    """Replace a bare service-name literal on a port field with its
+    numeric value from the --services file, else an UNKNOWN marker."""
+    if not fields:
+        return value
+    canon = fields[0][0]
+    if canon not in ("tcp-sport", "tcp-dport", "udp-sport", "udp-dport",
+                     "sctp-sport", "sctp-dport", "th-sport", "th-dport"):
+        return value
+    return _resolve_service_in_value(value, ctx)
+
+
+def _resolve_service_in_value(value, ctx):
+    kind = value.get("kind")
+    if kind == "lit":
+        text = value["text"]
+        if parse_int(text) is None and not looks_like_ip(text) \
+                and re.match(r"^[A-Za-z][A-Za-z0-9_-]*$", text):
+            port = resolve_service(text, ctx)
+            if port is None:
+                return v_unknown("symbolic-service",
+                                 "symbolic service %r unresolved (NF26)"
+                                 % text)
+            return v_lit(str(port))
+        return value
+    if kind in ("setlit", "list"):
+        key = "elements" if kind == "setlit" else "values"
+        newvals = [_resolve_service_in_value(v, ctx)
+                   for v in value[key]]
+        out = dict(value)
+        out[key] = newvals
+        return out
+    if kind == "tuple":
+        return {"kind": "tuple",
+                "values": [_resolve_service_in_value(v, ctx)
+                           for v in value["values"]]}
+    return value
+
+
+def eval_single_field(canon, value, op, mask, pkt, ctx, chain):
+    ctx.fields_read.add(canon)
+    # fields that are always UNKNOWN with a named finding (NF25/NF14)
+    if canon in ("meta-skuid", "meta-skgid"):
+        ctx.note_finding("process-context",
+                         "%s depends on process context (NF25)" % canon)
+        return Tri.UNKNOWN
+    if canon in ("meta-cpu", "meta-cgroup"):
+        ctx.note_finding("process-context",
+                         "%s depends on process context (NF25)" % canon)
+        return Tri.UNKNOWN
+    if canon in ("meta-time", "meta-day", "meta-hour"):
+        ctx.note_finding("wall-clock",
+                         "%s is a wall-clock match, a runtime fact (NF25)"
+                         % canon)
+        return Tri.UNKNOWN
+    if canon in ("meta-iiftype", "meta-oiftype"):
+        return Tri.UNKNOWN
+    if canon in ("ct-status", "ct-direction"):
+        return Tri.UNKNOWN
+    if canon in ("ip-length", "ip-ttl", "ip-dscp", "ip6-flowlabel"):
+        return Tri.UNKNOWN
+    if canon.startswith("ct-") and canon not in ("ct-state", "ct-mark"):
+        ctx.note_finding("unmodeled-field",
+                         "%s is outside the modeled ct subset (NF21)" % canon)
+        return Tri.UNKNOWN
+    if canon not in (
+            "ip-saddr", "ip-daddr", "ip6-saddr", "ip6-daddr",
+            "meta-iifname", "meta-oifname", "meta-nfproto",
+            "meta-l4proto", "ip-protocol", "ip6-nexthdr", "meta-mark",
+            "ct-mark", "meta-protocol", "tcp-sport", "tcp-dport",
+            "udp-sport", "udp-dport", "sctp-sport", "sctp-dport",
+            "th-sport", "th-dport", "tcp-flags", "icmp-type",
+            "icmpv6-type", "icmp-code", "icmpv6-code", "ct-state"):
+        ctx.note_finding("unmodeled-field",
+                         "field %s is outside the v1 surface (NF14)" % canon)
+        return Tri.UNKNOWN
+
+    pkt_value, gate = eval_field_value(canon, pkt, ctx)
+    if gate == Tri.FALSE:
+        # NF15: family-mismatched expression is silently FALSE.
+        return Tri.FALSE
+    if canon == "ct-state":
+        return eval_ct_state(value, pkt, ctx)
+    if canon == "meta-nfproto":
+        return eval_nfproto(value, pkt, ctx)
+    if canon == "tcp-flags":
+        return eval_tcp_flags(value, op, mask, pkt, ctx)
+    if value.get("kind") == "named":
+        return eval_named_set(chain, value["name"], pkt_value, canon, ctx)
+    if op in (">=", "<=", ">", "<"):
+        return eval_relop(value, op, pkt_value, ctx, canon)
+    return value_matches_scalar(value, pkt_value, pkt.family, ctx, canon)
+
+
+def eval_nfproto(value, pkt, ctx):
+    if pkt.family is None:
+        return Tri.UNKNOWN
+    want = value.get("text") if value.get("kind") == "lit" else None
+    if want is None:
+        return value_matches_scalar(value, pkt.family, pkt.family, ctx,
+                                    "meta-nfproto")
+    if want in ("ipv4", "ip"):
+        return Tri.TRUE if pkt.family == "ipv4" else Tri.FALSE
+    if want in ("ipv6", "ip6"):
+        return Tri.TRUE if pkt.family == "ipv6" else Tri.FALSE
+    return Tri.UNKNOWN
+
+
+def eval_ct_state(value, pkt, ctx):
+    if not pkt.ctstate:
+        return Tri.UNKNOWN
+    wanted = set()
+    unknown = False
+    for spec in _flatten_value_specs(value):
+        if spec.get("kind") == "lit":
+            wanted.add(spec["text"].lower())
+        elif spec.get("kind") == "unknown":
+            unknown = True
+    if unknown:
+        return Tri.UNKNOWN
+    if not wanted:
+        return Tri.UNKNOWN
+    bad = wanted - CT_STATES
+    if bad:
+        ctx.note_finding("unparseable",
+                         "unknown ct state(s): %s" % ", ".join(sorted(bad)))
+        return Tri.UNKNOWN
+    return Tri.TRUE if pkt.ctstate & wanted else Tri.FALSE
+
+
+def _flatten_value_specs(value):
+    kind = value.get("kind")
+    if kind in ("setlit",):
+        out = []
+        for e in value["elements"]:
+            out.extend(_flatten_value_specs(e))
+        return out
+    if kind == "list":
+        out = []
+        for v in value["values"]:
+            out.extend(_flatten_value_specs(v))
+        return out
+    return [value]
+
+
+def eval_tcp_flags(value, op, mask, pkt, ctx):
+    flags = pkt.tcpflags
+    if flags is None:
+        return Tri.UNKNOWN
+    # mask: bitmask idiom 'tcp flags & syn == syn'
+    mask_bits = None
+    if mask is not None:
+        mask_bits = _flags_to_bits(mask, ctx)
+        if mask_bits is None:
+            return Tri.UNKNOWN
+    else:
+        mask_bits = 0xFF
+    # value: flag names or a set of them
+    want_bits = _value_to_flag_bits(value, ctx)
+    if want_bits is None:
+        return Tri.UNKNOWN
+    masked = flags & mask_bits
+    if op == "==":
+        return Tri.TRUE if masked == want_bits else Tri.FALSE
+    if op == "!=":
+        return Tri.TRUE if masked != want_bits else Tri.FALSE
+    return Tri.UNKNOWN
+
+
+def _flags_to_bits(mask_text, ctx):
+    if mask_text.startswith("{"):
+        inner = mask_text.strip("{} ")
+        bits = 0
+        for part in inner.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            b = TCP_FLAG_BITS.get(part.lower())
+            if b is None:
+                n = parse_int(part)
+                if n is None:
+                    return None
+                bits |= n
+            else:
+                bits |= b
+        return bits
+    b = TCP_FLAG_BITS.get(mask_text.lower())
+    if b is not None:
+        return b
+    return parse_int(mask_text)
+
+
+def _value_to_flag_bits(value, ctx):
+    kind = value.get("kind")
+    if kind == "lit":
+        b = TCP_FLAG_BITS.get(value["text"].lower())
+        if b is not None:
+            return b
+        return parse_int(value["text"])
+    if kind in ("setlit", "list"):
+        key = "elements" if kind == "setlit" else "values"
+        bits = 0
+        for v in value[key]:
+            b = _value_to_flag_bits(v, ctx)
+            if b is None:
+                return None
+            bits |= b
+        return bits
+    return None
+
+
+def eval_relop(value, op, pkt_value, ctx, canon):
+    if pkt_value is None:
+        return Tri.UNKNOWN
+    if value.get("kind") != "lit":
+        return Tri.UNKNOWN
+    n = parse_int(value["text"])
+    if n is None:
+        return Tri.UNKNOWN
+    if isinstance(pkt_value, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        pkt_value = int(pkt_value)
+    if not isinstance(pkt_value, int):
+        return Tri.UNKNOWN
+    if op == ">=":
+        return Tri.TRUE if pkt_value >= n else Tri.FALSE
+    if op == "<=":
+        return Tri.TRUE if pkt_value <= n else Tri.FALSE
+    if op == ">":
+        return Tri.TRUE if pkt_value > n else Tri.FALSE
+    if op == "<":
+        return Tri.TRUE if pkt_value < n else Tri.FALSE
+    return Tri.UNKNOWN
+
+
+def eval_named_set(chain, name, pkt_value, canon, ctx):
+    table = chain.table
+    s = table.sets.get(name)
+    if s is None:
+        m = table.maps.get(name)
+        if m is not None:
+            ctx.note_finding("unparseable",
+                             "@%s names a map, used where a set is expected"
+                             % name)
+            return Tri.UNKNOWN
+        ctx.note_finding("load-would-fail",
+                         "reference to undeclared set @%s (nft would reject "
+                         "it)" % name)
+        return Tri.UNKNOWN
+    ctx.sets_consulted.append((table.family, table.name, name, s.file,
+                               s.line))
+    if s.poisoned:
+        ctx.note_finding("unmodeled-field",
+                         "set @%s is poisoned: %s" % (name, s.poison_reason))
+        return Tri.UNKNOWN
+    if s.dynamic:
+        ctx.note_finding("dynamic-set",
+                         "set @%s is flagged dynamic: contents at packet "
+                         "time are not the file's contents (NF18)" % name)
+        return Tri.UNKNOWN
+    if not s.elements:
+        ctx.note_finding("empty-at-load",
+                         "set @%s is empty at load (NF17)" % name)
+        return Tri.FALSE
+    results = []
+    for el in s.elements:
+        results.append(eval_element_against(el, pkt_value, pkt_family_of(ctx),
+                                            ctx, canon))
+    if Tri.TRUE in results:
+        if s.timeout:
+            ctx.note_finding("set-element-may-expire",
+                             "hit on timeout set @%s; the element may have "
+                             "expired (NF18)" % name)
+        return Tri.TRUE
+    if s.timeout:
+        ctx.note_finding("dynamic-set",
+                         "miss on timeout set @%s: an unlisted element may "
+                         "have been added with a timeout (NF18)" % name)
+        return Tri.UNKNOWN
+    if Tri.UNKNOWN in results:
+        return Tri.UNKNOWN
+    return Tri.FALSE
+
+
+def pkt_family_of(ctx):
+    return ctx.packet.family
+
+
+def eval_element_against(el, pkt_value, pkt_family, ctx, canon):
+    kind = el.get("kind")
+    if kind == "unknown":
+        ctx.note_finding(el["code"], el["message"])
+        return Tri.UNKNOWN
+    if kind == "hostname":
+        ctx.note_finding("load-time-dns",
+                         "hostname %r in a set is resolved at load time via "
+                         "DNS (NF26)" % el["text"])
+        return Tri.UNKNOWN
+    if kind == "tuple":
+        return Tri.UNKNOWN
+    if kind == "named":
+        return Tri.UNKNOWN
+    return value_matches_scalar(el, pkt_value, pkt_family, ctx, canon)
+
+
+def eval_concat(fields, value, op, pkt, ctx, chain):
+    """NF20: tuple match, element-wise; one FALSE component kills the
+    element, one UNKNOWN component makes it UNKNOWN."""
+    if value.get("kind") == "named":
+        return eval_named_concat(chain, value["name"], fields, pkt, ctx)
+    if value.get("kind") not in ("setlit", "list", "tuple"):
+        return Tri.UNKNOWN
+    key = "elements" if value.get("kind") == "setlit" else "values"
+    elements = value[key] if value.get("kind") != "tuple" else [value]
+    results = []
+    for el in elements:
+        results.append(eval_tuple_element(fields, el, pkt, ctx, chain))
+    if Tri.TRUE in results:
+        return Tri.TRUE
+    if Tri.UNKNOWN in results:
+        return Tri.UNKNOWN
+    return Tri.FALSE
+
+
+def eval_tuple_element(fields, el, pkt, ctx, chain):
+    if el.get("kind") == "tuple":
+        components = el["values"]
+    elif el.get("kind") in ("setlit", "list"):
+        components = el["elements"] if el.get("kind") == "setlit" \
+            else el["values"]
+    else:
+        components = [el]
+    if len(components) != len(fields):
+        return Tri.UNKNOWN
+    comp_results = []
+    for (canon, _fam, _raw), comp in zip(fields, components):
+        ctx.fields_read.add(canon)
+        comp = _maybe_resolve_service(comp, [(canon, None, None)], ctx)
+        if comp.get("kind") == "named":
+            pkt_value, _gate = eval_field_value(canon, pkt, ctx)
+            comp_results.append(eval_named_set(chain, comp["name"],
+                                               pkt_value, canon, ctx))
+            continue
+        pkt_value, gate = eval_field_value(canon, pkt, ctx)
+        if gate == Tri.FALSE:
+            comp_results.append(Tri.FALSE)
+            continue
+        if canon == "ct-state":
+            comp_results.append(eval_ct_state(comp, pkt, ctx))
+            continue
+        if canon == "tcp-flags":
+            comp_results.append(eval_tcp_flags(comp, "==", None, pkt, ctx))
+            continue
+        comp_results.append(value_matches_scalar(comp, pkt_value,
+                                                 pkt.family, ctx, canon))
+    return tri_and(comp_results)
+
+
+def eval_named_concat(chain, name, fields, pkt, ctx):
+    table = chain.table
+    s = table.sets.get(name)
+    if s is None:
+        ctx.note_finding("load-would-fail",
+                         "reference to undeclared set @%s" % name)
+        return Tri.UNKNOWN
+    ctx.sets_consulted.append((table.family, table.name, name, s.file,
+                               s.line))
+    if s.poisoned:
+        ctx.note_finding("unmodeled-field",
+                         "set @%s is poisoned: %s" % (name, s.poison_reason))
+        return Tri.UNKNOWN
+    if s.dynamic:
+        ctx.note_finding("dynamic-set",
+                         "set @%s is flagged dynamic (NF18)" % name)
+        return Tri.UNKNOWN
+    if not s.elements:
+        ctx.note_finding("empty-at-load",
+                         "set @%s is empty at load (NF17)" % name)
+        return Tri.FALSE
+    results = [eval_tuple_element(fields, el, pkt, ctx, chain)
+               for el in s.elements]
+    if Tri.TRUE in results:
+        if s.timeout:
+            ctx.note_finding("set-element-may-expire",
+                             "hit on timeout set @%s (NF18)" % name)
+        return Tri.TRUE
+    if s.timeout:
+        ctx.note_finding("dynamic-set",
+                         "miss on timeout set @%s (NF18)" % name)
+        return Tri.UNKNOWN
+    if Tri.UNKNOWN in results:
+        return Tri.UNKNOWN
+    return Tri.FALSE
+
+# ---------------------------------------------------------------- maps
+
+def lookup_map(chain, name, key_fields, pkt, ctx):
+    """Verdict/data map lookup. Returns (status, payload) where status
+    is 'hit', 'miss', or 'unknown'; payload is the map value spec."""
+    table = chain.table
+    m = table.maps.get(name)
+    if m is None:
+        ctx.note_finding("load-would-fail",
+                         "reference to undeclared map @%s" % name)
+        return "unknown", None
+    ctx.maps_consulted.append((table.family, table.name, name, m.file,
+                               m.line))
+    if m.poisoned:
+        ctx.note_finding("unmodeled-field",
+                         "map @%s is poisoned: %s" % (name, m.poison_reason))
+        return "unknown", None
+    if m.dynamic:
+        ctx.note_finding("dynamic-set",
+                         "map @%s is flagged dynamic (NF18)" % name)
+        return "unknown", None
+    if not m.elements:
+        return "miss", None
+    # key value: single field or concat tuple
+    key_values = []
+    for (canon, _fam, _raw) in key_fields:
+        ctx.fields_read.add(canon)
+        pkt_value, gate = eval_field_value(canon, pkt, ctx)
+        if gate == Tri.FALSE:
+            return "miss", None
+        key_values.append(pkt_value)
+    if any(v is None for v in key_values):
+        return "unknown", None
+    best = None       # (specificity, value spec)
+    for key_spec, val_spec in m.elements:
+        spec = map_key_specificity(key_spec, key_values, pkt, ctx)
+        if spec is None:
+            continue
+        if spec == "unknown":
+            if best is None:
+                best = ("unknown", None)
+            continue
+        if best is None or best[0] == "unknown" or spec > best[0]:
+            best = (spec, val_spec)
+    if best is None:
+        if m.timeout:
+            ctx.note_finding("dynamic-set",
+                             "miss on timeout map @%s (NF18)" % name)
+            return "unknown", None
+        return "miss", None
+    if best[0] == "unknown":
+        return "unknown", None
+    if m.timeout:
+        ctx.note_finding("set-element-may-expire",
+                         "hit on timeout map @%s (NF18)" % name)
+    return "hit", best[1]
+
+
+def map_key_specificity(key_spec, key_values, pkt, ctx):
+    """Does this map key match the packet key? Returns an int
+    specificity (higher = more specific, NF19 most-specific wins),
+    None for no match, or 'unknown'."""
+    if len(key_values) == 1:
+        return _key_component_specificity(key_spec, key_values[0], pkt, ctx)
+    # concat key
+    if key_spec.get("kind") != "tuple":
+        return None
+    components = key_spec["values"]
+    if len(components) != len(key_values):
+        return None
+    total = 0
+    for comp, kv in zip(components, key_values):
+        s = _key_component_specificity(comp, kv, pkt, ctx)
+        if s is None:
+            return None
+        if s == "unknown":
+            return "unknown"
+        total += s
+    return total
+
+
+def _key_component_specificity(key_spec, pkt_value, pkt, ctx):
+    kind = key_spec.get("kind")
+    if kind == "unknown":
+        return "unknown"
+    if kind == "hostname":
+        return "unknown"
+    if kind == "lit":
+        text = key_spec["text"]
+        if pkt_value is None:
+            return "unknown"
+        if isinstance(pkt_value, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+            if looks_like_ip(text):
+                try:
+                    return 128 if pkt_value == ipaddress.ip_address(text) \
+                        else None
+                except ValueError:
+                    return None
+            return "unknown"
+        if isinstance(pkt_value, int):
+            n = parse_int(text)
+            if n is not None:
+                return 32 if pkt_value == n else None
+            if isinstance(pkt_value, str):
+                return 32 if pkt_value == text else None
+            return "unknown"
+        if isinstance(pkt_value, str):
+            return 32 if pkt_value == text else None
+        return "unknown"
+    if kind == "prefix":
+        if pkt_value is None:
+            return "unknown"
+        try:
+            if pkt_value in key_spec["network"]:
+                return key_spec["network"].prefixlen
+        except TypeError:
+            return None
+        return None
+    if kind == "range":
+        if pkt_value is None:
+            return "unknown"
+        v = int(pkt_value) if not isinstance(pkt_value, int) else pkt_value
+        if key_spec["lo"] <= v <= key_spec["hi"]:
+            width = key_spec["hi"] - key_spec["lo"]
+            return max(0, 64 - width.bit_length())
+        return None
+    if kind == "setlit":
+        best = None
+        for e in key_spec["elements"]:
+            s = _key_component_specificity(e, pkt_value, pkt, ctx)
+            if s == "unknown":
+                if best is None:
+                    best = "unknown"
+                continue
+            if s is not None and (best is None or best == "unknown"
+                                  or s > best):
+                best = s
+        return best
+    return "unknown"
+
+
+def eval_data_map_value(chain, map_name, key_fields, pkt, ctx):
+    """Data-map lookup for NAT/mark statements. Returns (status, value)
+    where value is a literal text or None."""
+    status, val = lookup_map(chain, map_name, key_fields, pkt, ctx)
+    if status != "hit":
+        return status, None
+    if val.get("kind") == "data":
+        inner = val["value"]
+        if inner.get("kind") == "lit":
+            return "hit", inner["text"]
+        return "unknown", None
+    return "unknown", None
+
+
+# ---------------------------------------------------------------- walker
+
+class WalkState:
+    def __init__(self):
+        self.nat_outcomes = []   # {kind, target, hook, file, line}
+        self.walk_log = []       # per-chain walk entries
+        self.blocker = None      # earliest blocking candidate
+        self.ingress_chains = []
+        self.nat_chains_seen = []
+
+
+def chain_walk_entry(chain):
+    return {"chain": chain, "rules": [], "outcome": None, "policy": None}
+
+
+def eval_rule_match(rule, pkt, ctx):
+    """NF13 conjunction over the rule's match expressions (Kleene AND).
+    Returns Tri. Never-matches detection (NF15) is recorded as a
+    finding when the conjunction is unsatisfiable on family grounds."""
+    if not rule.matches:
+        return Tri.TRUE
+    results = []
+    for expr in rule.matches:
+        if expr.get("kind") == "poison":
+            ctx.note_finding(expr["code"], expr["message"],
+                             expr.get("file"), expr.get("line"))
+            results.append(Tri.UNKNOWN)
+        else:
+            results.append(eval_match_expr(expr, pkt, ctx, rule.chain))
+    # NF15 never-matches: ip + ip6 address fields in one rule
+    fams = set()
+    for expr in rule.matches:
+        if expr.get("kind") != "match":
+            continue
+        for canon, fam, _raw in expr["fields"]:
+            if fam:
+                fams.add(fam)
+    if fams == {"ipv4", "ipv6"}:
+        ctx.note_finding("never-matches",
+                         "rule at %s:%d mixes ip and ip6 address fields; "
+                         "it matches nothing, ever (NF15)"
+                         % (rule.file, rule.line))
+        return Tri.FALSE
+    return tri_and(results)
+
+
+def rule_has_terminal_verdict(rule):
+    return rule.has_terminal()
+
+
+def walk_chain(chain, pkt, ctx, state, stack):
+    """Walk one chain. Returns an outcome dict:
+    kind: 'accept' | 'drop' | 'reject' | 'queue' | 'policy-accept' |
+          'policy-drop' | 'return' | 'goto-exhausted' | 'nat-bound' |
+          'unknown'
+    decider: (file, line, label) for terminal outcomes.
+    """
+    entry = chain_walk_entry(chain)
+    state.walk_log.append(entry)
+    if chain.name in stack:
+        ctx.note_finding("chain-loop",
+                         "jump/goto cycle at chain %s (NF11)" % chain.name,
+                         chain.file, chain.line)
+        entry["outcome"] = "unknown (chain-loop)"
+        return {"kind": "unknown", "blocker": (chain.file, chain.line,
+                                               "chain-loop")}
+    if len(stack) >= MAX_CHAIN_DEPTH:
+        ctx.note_finding("chain-loop",
+                         "call depth cap exceeded at chain %s" % chain.name,
+                         chain.file, chain.line)
+        entry["outcome"] = "unknown (depth cap)"
+        return {"kind": "unknown", "blocker": (chain.file, chain.line,
+                                               "call depth cap")}
+    stack = stack + [chain.name]
+    for rule in chain.rules:
+        outcome = walk_rule(rule, pkt, ctx, state, stack, entry)
+        if outcome is None:
+            continue
+        if outcome["kind"] == "goto-exhausted":
+            if chain.is_base:
+                return apply_policy(chain, pkt, ctx, state, entry,
+                                    "goto exhaustion (NF11)")
+            entry["outcome"] = "goto-exhausted"
+            return outcome
+        entry["outcome"] = outcome["kind"]
+        return outcome
+    # fall-through
+    if chain.is_base:
+        return apply_policy(chain, pkt, ctx, state, entry, "fall-through")
+    entry["outcome"] = "return"
+    return {"kind": "return"}
+
+
+def apply_policy(chain, pkt, ctx, state, entry, why):
+    entry["policy"] = chain.policy
+    entry["outcome"] = "policy-" + chain.policy
+    if chain.policy == "drop":
+        return {"kind": "drop",
+                "decider": (chain.file, chain.policy_line,
+                            "policy drop (%s)" % why),
+                "fields_read": set()}
+    return {"kind": "policy-accept",
+            "decider": (chain.file, chain.policy_line,
+                        "policy accept (%s)" % why),
+            "fields_read": set()}
+
+
+def walk_rule(rule, pkt, ctx, state, stack, entry):
+    """Evaluate one rule. Returns None (continue to next rule) or an
+    outcome dict (chain decided / unknown / return / goto-exhausted /
+    nat-bound)."""
+    fields_before = set(ctx.fields_read)
+    if rule.unparseable:
+        # NF29: poisons the chain from its position onward; earlier
+        # deciders still decide (we only reach here in order).
+        entry["rules"].append((rule, "blocking (unparseable)"))
+        return {"kind": "unknown",
+                "blocker": (rule.file, rule.line,
+                            "unparseable rule: %s"
+                            % (rule.unparseable_reason or "?"))}
+    match = eval_rule_match(rule, pkt, ctx)
+    if match == Tri.FALSE:
+        entry["rules"].append((rule, "no-match"))
+        return None
+    if match == Tri.UNKNOWN:
+        if rule_has_terminal_verdict(rule):
+            entry["rules"].append((rule, "blocking candidate"))
+            return {"kind": "unknown",
+                    "blocker": (rule.file, rule.line,
+                                "rule match is UNKNOWN and the rule could "
+                                "decide (NF27)")}
+        if rule.has_mutation():
+            # state after this rule is uncertain (NF23/NF27)
+            ctx.meta_mark = None
+            ctx.ct_mark = None
+            entry["rules"].append((rule, "unknown-match (state uncertain)"))
+        else:
+            entry["rules"].append((rule, "unknown-match (non-deciding)"))
+        return None
+    # match TRUE: execute statements in order
+    for stmt in rule.statements:
+        outcome = exec_statement(stmt, rule, pkt, ctx, state, stack, entry)
+        if outcome is not None:
+            outcome["fields_read"] = set(ctx.fields_read) - fields_before
+            outcome.setdefault("rule", rule)
+            return outcome
+    entry["rules"].append((rule, "matched, no verdict"))
+    return None
+
+
+def exec_statement(stmt, rule, pkt, ctx, state, stack, entry):
+    kind = stmt["kind"]
+    if kind == "accept":
+        entry["rules"].append((rule, "decider: accept"))
+        return {"kind": "accept",
+                "decider": (rule.file, rule.line, "accept"),
+                "fields_read": set()}
+    if kind == "drop":
+        entry["rules"].append((rule, "decider: drop"))
+        return {"kind": "drop",
+                "decider": (rule.file, rule.line, "drop"),
+                "fields_read": set()}
+    if kind == "reject":
+        entry["rules"].append((rule, "decider: reject"))
+        return {"kind": "reject",
+                "decider": (rule.file, rule.line,
+                            "reject" + (" with " + stmt.get("reject_type", "")
+                                        if stmt.get("reject_type") else "")),
+                "fields_read": set()}
+    if kind == "queue":
+        entry["rules"].append((rule, "decider: queue"))
+        return {"kind": "queue",
+                "decider": (rule.file, rule.line, "queue"),
+                "fields_read": set()}
+    if kind == "continue":
+        return None
+    if kind == "return":
+        if rule.chain.is_base:
+            return apply_policy(rule.chain, pkt, ctx, state, entry,
+                                "return in base chain (NF09)")
+        entry["rules"].append((rule, "return"))
+        return {"kind": "return"}
+    if kind == "jump":
+        target = rule.chain.table.chains.get(stmt["target"])
+        if target is None:
+            ctx.note_finding("load-would-fail",
+                             "jump to undeclared chain %r" % stmt["target"],
+                             stmt["file"], stmt["line"])
+            entry["rules"].append((rule, "blocking (jump to missing chain)"))
+            return {"kind": "unknown",
+                    "blocker": (stmt["file"], stmt["line"],
+                                "jump to undeclared chain %s"
+                                % stmt["target"])}
+        sub = walk_chain(target, pkt, ctx, state, stack)
+        if sub["kind"] in ("accept", "drop", "reject", "queue"):
+            sub.setdefault("rule", rule)
+            return sub
+        if sub["kind"] == "unknown":
+            return sub
+        if sub["kind"] == "goto-exhausted":
+            return sub
+        # return / fall-through / policy-accept / nat-bound: resume caller
+        return None
+    if kind == "goto":
+        target = rule.chain.table.chains.get(stmt["target"])
+        if target is None:
+            ctx.note_finding("load-would-fail",
+                             "goto to undeclared chain %r" % stmt["target"],
+                             stmt["file"], stmt["line"])
+            entry["rules"].append((rule, "blocking (goto to missing chain)"))
+            return {"kind": "unknown",
+                    "blocker": (stmt["file"], stmt["line"],
+                                "goto to undeclared chain %s"
+                                % stmt["target"])}
+        sub = walk_chain(target, pkt, ctx, state, stack)
+        if sub["kind"] in ("accept", "drop", "reject", "queue"):
+            sub.setdefault("rule", rule)
+            return sub
+        if sub["kind"] == "unknown":
+            return sub
+        if sub["kind"] == "goto-exhausted":
+            return sub
+        # NF11: goto exhaustion -> base chain's policy, caller's
+        # remaining rules are dead.
+        entry["rules"].append((rule, "goto exhausted"))
+        return {"kind": "goto-exhausted"}
+    if kind == "vmap":
+        return exec_vmap(stmt, rule, pkt, ctx, state, stack, entry)
+    if kind == "nat":
+        return exec_nat(stmt, rule, pkt, ctx, state, entry)
+    if kind == "mark-set":
+        return exec_mark_set(stmt, rule, pkt, ctx, "meta")
+    if kind == "ctmark-set":
+        return exec_mark_set(stmt, rule, pkt, ctx, "ct")
+    if kind == "notrack":
+        ctx.ctstate = {"untracked"}
+        pkt.ctstate = {"untracked"}
+        return None
+    if kind == "flow":
+        ctx.note_finding("flow-offload",
+                         "flow offload statement on a matched rule; "
+                         "fast-path state is runtime (Out-of-scope)")
+        return None
+    if kind == "reroute":
+        ctx.note_finding("reroute",
+                         "reroute statement on a matched rule (NF29)")
+        return None
+    return None
+
+
+def exec_vmap(stmt, rule, pkt, ctx, state, stack, entry):
+    fields = stmt["fields"]
+    if "map" in stmt:
+        status, val = lookup_map(rule.chain, stmt["map"], fields, pkt, ctx)
+        if status == "miss":
+            # NF19: no entry and no default -> no verdict, continue
+            return None
+        if status == "unknown":
+            entry["rules"].append((rule, "blocking (vmap unknown)"))
+            return {"kind": "unknown",
+                    "blocker": (rule.file, rule.line,
+                                "verdict-map lookup is UNKNOWN (NF19)")}
+        return exec_map_verdict(val, rule, pkt, ctx, state, stack, entry)
+    # anonymous vmap: entries list
+    key_values = []
+    for (canon, _fam, _raw) in fields:
+        ctx.fields_read.add(canon)
+        pkt_value, gate = eval_field_value(canon, pkt, ctx)
+        if gate == Tri.FALSE:
+            return None
+        key_values.append(pkt_value)
+    if any(v is None for v in key_values):
+        entry["rules"].append((rule, "blocking (vmap key unknown)"))
+        return {"kind": "unknown",
+                "blocker": (rule.file, rule.line,
+                            "verdict-map key is UNKNOWN (NF19)")}
+    best = None
+    default = None
+    for key_spec, val_spec in stmt.get("entries", []):
+        if key_spec.get("kind") == "lit" and key_spec.get("text") == "*":
+            default = val_spec
+            continue
+        spec = map_key_specificity(key_spec, key_values, pkt, ctx)
+        if spec is None:
+            continue
+        if spec == "unknown":
+            if best is None:
+                best = ("unknown", None)
+            continue
+        if best is None or best[0] == "unknown" or spec > best[0]:
+            best = (spec, val_spec)
+    if best is None:
+        if default is not None:
+            return exec_map_verdict(default, rule, pkt, ctx, state, stack,
+                                    entry)
+        return None
+    if best[0] == "unknown":
+        entry["rules"].append((rule, "blocking (vmap key unknown)"))
+        return {"kind": "unknown",
+                "blocker": (rule.file, rule.line,
+                            "verdict-map key match is UNKNOWN (NF19)")}
+    return exec_map_verdict(best[1], rule, pkt, ctx, state, stack, entry)
+
+
+def exec_map_verdict(val, rule, pkt, ctx, state, stack, entry):
+    if val.get("kind") == "verdict":
+        st = dict(val["stmt"])
+        st.setdefault("file", rule.file)
+        st.setdefault("line", rule.line)
+        return exec_statement(st, rule, pkt, ctx, state, stack, entry)
+    return None
+
+
+def exec_nat(stmt, rule, pkt, ctx, state, entry):
+    kind = stmt["nat_kind"]
+    target = stmt.get("target")
+    if stmt.get("map"):
+        status, value = eval_data_map_value(rule.chain, stmt["map"],
+                                            stmt.get("keyfield") or [], pkt,
+                                            ctx)
+        if status == "miss":
+            # NF19: missing key -> statement does not execute
+            return None
+        if status == "unknown":
+            entry["rules"].append((rule, "blocking (nat map unknown)"))
+            return {"kind": "unknown",
+                    "blocker": (rule.file, rule.line,
+                                "NAT data-map lookup is UNKNOWN (NF19)")}
+        target = value
+    outcome = {"kind": kind, "target": target,
+               "file": rule.file, "line": rule.line}
+    state.nat_outcomes.append(outcome)
+    entry["rules"].append((rule, "decider: %s to %s" % (kind, target or "")))
+    # NF22: NAT statement is terminal for its chain, not for the packet.
+    return {"kind": "nat-bound", "nat": outcome, "fields_read": set()}
+
+
+def exec_mark_set(stmt, rule, pkt, ctx, which):
+    toks = stmt.get("value_toks") or []
+    if not toks:
+        # 'meta mark set ct mark' with the value swallowed, or an empty
+        # value: the mark becomes UNKNOWN (NF23).
+        _set_mark(ctx, which, None)
+        return None
+    # forms: LITERAL | FIELD | FIELD map @NAME | ct mark | arithmetic
+    if len(toks) >= 3 and toks[-2].text == "map" \
+            and toks[-1].text.startswith("@"):
+        key_toks = toks[:-2]
+        fields = parse_fields_only(key_toks)
+        status, value = eval_data_map_value(rule.chain, toks[-1].text[1:],
+                                            fields, pkt, ctx)
+        if status == "miss":
+            return None
+        if status == "unknown":
+            return {"kind": "unknown",
+                    "blocker": (rule.file, rule.line,
+                                "mark data-map lookup is UNKNOWN (NF19)")}
+        n = parse_int(value)
+        if n is None:
+            return None
+        _set_mark(ctx, which, n)
+        return None
+    text = " ".join(t.text for t in toks)
+    n = parse_int(text)
+    if n is not None:
+        _set_mark(ctx, which, n)
+        return None
+    # field reference or expression: mark becomes UNKNOWN (NF23)
+    if len(toks) == 1 and toks[0].text in ("ct", "meta"):
+        pass
+    _set_mark(ctx, which, None)
+    return None
+
+
+def _set_mark(ctx, which, value):
+    if which == "meta":
+        ctx.meta_mark = value
+    else:
+        ctx.ct_mark = value
+
+
+def parse_fields_only(toks):
+    """Parse leading FIELD [. FIELD]* tokens into field specs."""
+    fields = []
+    i = 0
+    while i < len(toks):
+        t0 = toks[i]
+        if t0.text in ("iif", "oif", "iifname", "oifname"):
+            canon = FIELD_TABLE[(t0.text, None)]
+            fields.append((canon[0], canon[1], t0.text))
+            i += 1
+        elif i + 1 < len(toks) and (t0.text, toks[i + 1].text) in FIELD_TABLE:
+            canon = FIELD_TABLE[(t0.text, toks[i + 1].text)]
+            fields.append((canon[0], canon[1],
+                           t0.text + " " + toks[i + 1].text))
+            i += 2
+        else:
+            break
+        if i < len(toks) and toks[i].text == ".":
+            i += 1
+            continue
+        break
+    return fields
+
+
+# ---------------------------------------------------------------- hook / path
+
+def base_chains_at(tables, hook, family):
+    """All base chains at one hook in applicable families (NF05/NF07),
+    in (priority, stream order)."""
+    fams = FAMILY_PACKET.get(family, set()) if family else \
+        {"ip", "ip6", "inet"}
+    out = []
+    for (fam, _name), table in tables.items():
+        if fam not in fams:
+            continue
+        for chain in table.chains.values():
+            if chain.is_base and chain.hook == hook:
+                out.append(chain)
+    out.sort(key=lambda c: (c.priority if c.priority is not None else 0,
+                            c.stream_index))
+    return out
+
+
+def walk_hook(hook, pkt, ctx, state, tables):
+    """NF08: walk every base chain at the hook in priority order.
+    Returns (verdict, decider, fields_read_by_decider)."""
+    chains = base_chains_at(tables, hook, pkt.family)
+    if not chains:
+        return ("NOT-EVALUATED", None, set())
+    # same-priority collision finding (NF07)
+    seen_prio = {}
+    for ch in chains:
+        p = ch.priority if ch.priority is not None else 0
+        if p in seen_prio:
+            ctx.note_finding(
+                "same-priority-order",
+                "base chains %s and %s share priority %d at hook %s; "
+                "order is merged-stream declaration order (NF07)"
+                % (seen_prio[p].name, ch.name, p, hook))
+        else:
+            seen_prio[p] = ch
+    last_policy = None
+    decider_fields = set()
+    for chain in chains:
+        if chain.type == "nat":
+            state.nat_chains_seen.append(chain)
+        outcome = walk_chain(chain, pkt, ctx, state, [])
+        kind = outcome["kind"]
+        if kind == "accept" or kind == "policy-accept":
+            last_policy = outcome.get("decider")
+            continue
+        if kind in ("drop", "reject"):
+            return (kind.upper(), outcome.get("decider"),
+                    outcome.get("fields_read", set()))
+        if kind == "queue":
+            return ("QUEUED-UNKNOWN", outcome.get("decider"), set())
+        if kind == "unknown":
+            return ("UNKNOWN", outcome.get("blocker"), set())
+        if kind == "nat-bound":
+            continue
+        if kind in ("return", "goto-exhausted"):
+            # should not escape a base chain; treat as policy
+            continue
+    return ("ACCEPT", last_policy, decider_fields)
+
+
+def evaluate(tables, pkt, ctx, hook=None, path=None):
+    """Top-level traversal (NF06/NF08/NF22). Returns a result dict."""
+    state = WalkState()
+    # NF05: arp/bridge/netdev tables are inventory + banner only.
+    for (fam, name) in sorted(tables):
+        if fam in ("arp", "bridge", "netdev"):
+            ctx.note_finding(
+                "out-of-scope-family",
+                "table %s %s cannot decide a v1 packet query; it is "
+                "inventory only (NF05)" % (fam, name))
+    result = {"verdict": None, "decider": None, "nat": [],
+              "nat_unknown": False, "nat_skipped": False,
+              "hooks": [], "findings": ctx.findings, "state": state}
+    hooks = [hook] if hook else PATH_HOOKS[path]
+    # NF05 ingress caveat for composed paths
+    ingress_degrade = None
+    if path in ("in", "forward"):
+        for ch in base_chains_at(tables, "ingress", pkt.family):
+            if ch.table.family in ("inet", "netdev"):
+                ingress_degrade = ch
+                state.ingress_chains.append(ch)
+                break
+    # NAT first-packet gating (NF22)
+    nat_unknown = False
+    nat_skipped = False
+    if pkt.ctstate and pkt.ctstate != {"new"}:
+        nat_skipped = True
+    elif not pkt.ctstate:
+        nat_unknown = True if any(
+            ch.type == "nat"
+            for h in hooks for ch in base_chains_at(tables, h, pkt.family)) \
+            else False
+    final = None
+    final_decider = None
+    nat_fired = []      # (hook, outcome, fields_read_after)
+    for h in hooks:
+        verdict, decider, fields_read = walk_hook(h, pkt, ctx, state, tables)
+        nat_here = [o for o in state.nat_outcomes]
+        result["hooks"].append({"hook": h, "verdict": verdict,
+                               "decider": decider})
+        if verdict == "DROP" or verdict == "REJECT":
+            final, final_decider = verdict, decider
+            break
+        if verdict == "QUEUED-UNKNOWN":
+            final, final_decider = verdict, decider
+            break
+        if verdict == "UNKNOWN":
+            final, final_decider = verdict, decider
+            break
+        if verdict == "NOT-EVALUATED":
+            continue
+        # ACCEPT at this hook: record any NAT fired here for NF22
+        for o in nat_here:
+            if o not in [n[1] for n in nat_fired]:
+                nat_fired.append((h, o))
+        final = "ACCEPT"
+        final_decider = decider
+    if final is None:
+        final, final_decider = "NOT-EVALUATED", None
+    # NF22 nat-rewrites-tuple degradation on composed paths: a later
+    # deciding match that reads a field the NAT kind rewrites makes
+    # the composed verdict UNKNOWN, whatever that verdict would be.
+    if path and nat_fired and final in ("ACCEPT", "DROP", "REJECT"):
+        fired_hooks = [h for h, _o in nat_fired]
+        for h, outcome in nat_fired:
+            rewritten = nat_rewritten_fields(outcome)
+            later = [r for r in result["hooks"]
+                     if PATH_HOOKS[path].index(r["hook"])
+                     > PATH_HOOKS[path].index(h)]
+            # check later hooks' deciding rules' fields
+            for lr in later:
+                fields = later_decider_fields(state, lr["hook"])
+                if fields & rewritten:
+                    ctx.note_finding(
+                        "nat-rewrites-tuple",
+                        "NAT %s at %s:%d on hook %s rewrites %s, and a "
+                        "later deciding match on hook %s reads it; the "
+                        "composed path verdict is UNKNOWN (NF22)"
+                        % (outcome["kind"], outcome["file"], outcome["line"],
+                           h, ", ".join(sorted(fields & rewritten)),
+                           lr["hook"]))
+                    final = "UNKNOWN"
+                    final_decider = (outcome["file"], outcome["line"],
+                                     "nat-rewrites-tuple")
+                    break
+            if final == "UNKNOWN":
+                break
+    if ingress_degrade and path:
+        ctx.note_finding(
+            "ingress-unmodeled",
+            "inet/netdev ingress base chain %s exists; its match surface "
+            "(ether/vlan) is out of the v1 field surface, so the composed "
+            "path verdict degrades to UNKNOWN (NF05)"
+            % ingress_degrade.name)
+        final = "UNKNOWN"
+        final_decider = (ingress_degrade.file, ingress_degrade.line,
+                         "ingress chain %s" % ingress_degrade.name)
+    result["verdict"] = final
+    result["decider"] = final_decider
+    result["nat"] = state.nat_outcomes
+    result["nat_unknown"] = nat_unknown and not nat_skipped
+    result["nat_skipped"] = nat_skipped
+    result["nat_fired"] = nat_fired
+    return result
+
+
+def nat_rewritten_fields(outcome):
+    """Fields a NAT kind rewrites (NF22). A port is rewritten only
+    when the target names one (dnat/snat 'to ADDR:PORT'); redirect
+    and masquerade always rewrite the port."""
+    kind = outcome["kind"]
+    target = outcome.get("target") or ""
+    has_port = ":" in target
+    if kind in ("dnat", "tproxy"):
+        fields = {"ip-daddr", "ip6-daddr"}
+        if has_port or kind == "tproxy":
+            fields |= {"tcp-dport", "udp-dport", "th-dport", "sctp-dport"}
+        return fields
+    if kind == "redirect":
+        return {"ip-daddr", "ip6-daddr", "tcp-dport", "udp-dport",
+                "th-dport", "sctp-dport"}
+    if kind == "snat":
+        fields = {"ip-saddr", "ip6-saddr"}
+        if has_port:
+            fields |= {"tcp-sport", "udp-sport", "th-sport", "sctp-sport"}
+        return fields
+    if kind == "masquerade":
+        return {"ip-saddr", "ip6-saddr", "tcp-sport", "udp-sport",
+                "th-sport", "sctp-sport"}
+    return set()
+
+
+def later_decider_fields(state, hook):
+    """Fields read by the deciding rule(s) of one hook's walk (NF22):
+    rules logged as deciders in walk entries of chains at that hook."""
+    fields = set()
+    for entry in state.walk_log:
+        if entry["chain"].hook != hook:
+            continue
+        for rule, outcome in entry["rules"]:
+            if outcome.startswith("decider"):
+                for expr in rule.matches:
+                    if expr.get("kind") == "match":
+                        for canon, _f, _r in expr["fields"]:
+                            fields.add(canon)
+    return fields
+
+
+# ---------------------------------------------------------------- rendering
+
+def verdict_label(result):
+    v = result["verdict"]
+    d = result["decider"]
+    if v == "ACCEPT":
+        if d and "policy" in str(d[2]):
+            return "ACCEPT (policy)"
+        return "ACCEPT (rule)"
+    if v == "DROP":
+        if d and "policy" in str(d[2]):
+            return "DROP (policy)"
+        return "DROP (rule)"
+    if v == "REJECT":
+        return "REJECT (rule)"
+    return v
+
+
+def exit_code_for(result):
+    v = result["verdict"]
+    if v == "ACCEPT":
+        return 0
+    if v in ("DROP", "REJECT", "NOT-EVALUATED"):
+        return 1
+    return 2
+
+
+def render_text(result, ctx, loader, tables, query):
+    lines = []
+    label = verdict_label(result)
+    d = result["decider"]
+    if d:
+        lines.append("%s — %s:%s (%s)" % (label, d[0], d[1], d[2]))
+    else:
+        lines.append(label)
+    # NAT block (NF28)
+    if result["nat_skipped"]:
+        lines.append("NAT: skipped (not first packet)")
+    elif result["nat_unknown"]:
+        lines.append("NAT: UNKNOWN (ctstate not supplied; nat chains on "
+                     "the traversal)")
+    elif result["nat"]:
+        for o in result["nat"]:
+            tgt = (" to %s" % o["target"]) if o.get("target") else ""
+            lines.append("NAT: %s%s (rule at %s:%d)"
+                         % (o["kind"], tgt, o["file"], o["line"]))
+    elif result["state"].nat_chains_seen:
+        walked = ", ".join(c.name for c in result["state"].nat_chains_seen)
+        lines.append("NAT: none (no nat rule matched; chains walked: %s)"
+                     % walked)
+    lines.append("")
+    lines.append("Walk:")
+    for h in result["hooks"]:
+        dec = h["decider"]
+        dec_s = (" — %s:%s (%s)" % (dec[0], dec[1], dec[2])) if dec else ""
+        lines.append("  hook %s: %s%s" % (h["hook"], h["verdict"], dec_s))
+    for entry in result["state"].walk_log:
+        ch = entry["chain"]
+        lines.append("  chain %s %s %s (priority %s, policy %s) [%s:%d]:"
+                     % (ch.table.family, ch.table.name, ch.name,
+                        ch.priority if ch.priority is not None else "?",
+                        ch.policy, ch.file, ch.line))
+        for rule, outcome in entry["rules"]:
+            lines.append("    %s:%d: %s — %s"
+                         % (rule.file, rule.line, rule.text, outcome))
+        if entry["outcome"]:
+            lines.append("    -> %s" % entry["outcome"])
+    # rules after the decider in a walked chain are not-reached (NF10)
+    lines.append("")
+    if ctx.findings:
+        lines.append("Findings:")
+        for f in ctx.findings:
+            lines.append("  [%s] %s (%s)" % (f.code, f.message, f.where()))
+        lines.append("")
+    lines.append("Coverage:")
+    lines.append("  Files read:")
+    for path, via in loader.files_read:
+        lines.append("    %s (%s)" % (path, via))
+    lines.append("  Tables/chains on the traversal:")
+    hooks = [query["hook"]] if query.get("hook") else PATH_HOOKS[query["path"]]
+    for h in hooks:
+        for ch in base_chains_at(tables, h, query.get("family")):
+            lines.append("    %s %s %s hook=%s priority=%s policy=%s "
+                         "[%s:%d]" % (ch.table.family, ch.table.name,
+                                      ch.name, ch.hook, ch.priority,
+                                      ch.policy, ch.file, ch.line))
+    consulted = set()
+    for _f, _t, name, f, l in ctx.sets_consulted:
+        consulted.add(("set", name, f, l))
+    for _f, _t, name, f, l in ctx.maps_consulted:
+        consulted.add(("map", name, f, l))
+    if consulted:
+        lines.append("  Sets/maps consulted:")
+        for kind, name, f, l in sorted(consulted):
+            lines.append("    %s @%s [%s:%d]" % (kind, name, f, l))
+    if ctx.defines_expanded:
+        lines.append("  Defines expanded:")
+        for name, f, l in ctx.defines_expanded:
+            lines.append("    $%s at %s:%d" % (name, f, l))
+    lines.append("  Banners: this answer covers only the ruleset file and "
+                 "its include tree; other writers' rules (firewalld / "
+                 "Docker / kube-proxy), routing, and runtime element "
+                 "changes are outside the file (NF01/NF19).")
+    return "\n".join(lines) + "\n"
+
+
+def result_to_json(result, ctx, loader, tables, query):
+    d = result["decider"]
+    out = {
+        "verdict": result["verdict"],
+        "verdict_label": verdict_label(result),
+        "decider": ({"file": d[0], "line": d[1], "label": d[2]}
+                    if d else None),
+        "nat": [{"kind": o["kind"], "target": o.get("target"),
+                 "file": o["file"], "line": o["line"]}
+                for o in result["nat"]],
+        "nat_unknown": result["nat_unknown"],
+        "nat_skipped": result["nat_skipped"],
+        "hooks": [{"hook": h["hook"], "verdict": h["verdict"],
+                   "decider": ({"file": h["decider"][0],
+                                "line": h["decider"][1],
+                                "label": h["decider"][2]}
+                               if h["decider"] else None)}
+                  for h in result["hooks"]],
+        "walk": [],
+        "findings": [f.to_dict() for f in ctx.findings],
+        "coverage": {
+            "files": [{"path": p, "via": v}
+                      for p, v in loader.files_read],
+            "sets_consulted": [
+                {"name": n, "file": f, "line": l}
+                for _k, n, f, l in
+                sorted({(k, n, f, l)
+                        for k, n, f, l in
+                        [(t, nm, ff, ll) for _a, _b, nm, ff, ll
+                         in ctx.sets_consulted]} |
+                       {(k, n, f, l) for k, n, f, l in
+                        [(t, nm, ff, ll) for _a, _b, nm, ff, ll
+                         in ctx.maps_consulted]})],
+        },
+    }
+    for entry in result["state"].walk_log:
+        ch = entry["chain"]
+        out["walk"].append({
+            "chain": "%s %s %s" % (ch.table.family, ch.table.name, ch.name),
+            "hook": ch.hook, "priority": ch.priority, "policy": ch.policy,
+            "file": ch.file, "line": ch.line,
+            "outcome": entry["outcome"],
+            "rules": [{"file": r.file, "line": r.line, "text": r.text,
+                       "outcome": o} for r, o in entry["rules"]]})
+    return out
+
+
+# ---------------------------------------------------------------- CLI
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="nftwho",
+        description="Which rule in which chain of an nftables ruleset "
+        "file decides one packet at one traversal — and where that "
+        "rule lives. Static only: never loads a ruleset, never invokes "
+        "nft on user files.")
+    p.add_argument("conf", nargs="?", help="ruleset file to adjudicate")
+    p.add_argument("--conf", dest="conf_flag", default=None,
+                   help="ruleset file to adjudicate")
+    p.add_argument("--hook", choices=sorted(HOOKS),
+                   help="single netfilter hook to evaluate")
+    p.add_argument("--path", choices=["in", "forward", "out"],
+                   help="composed path: in, forward, or out")
+    p.add_argument("--family", choices=["ipv4", "ipv6"],
+                   help="packet address family")
+    p.add_argument("--saddr", help="source address")
+    p.add_argument("--daddr", help="destination address")
+    p.add_argument("--proto", help="protocol name or number")
+    p.add_argument("--sport", help="source port (number or service name)")
+    p.add_argument("--dport", help="destination port (number or service name)")
+    p.add_argument("--iif", help="input interface name")
+    p.add_argument("--oif", help="output interface name")
+    p.add_argument("--ctstate",
+                   help="conntrack state, comma-separated "
+                   "(new,established,related,invalid,untracked)")
+    p.add_argument("--mark", help="meta mark (decimal or 0x hex)")
+    p.add_argument("--tcpflags",
+                   help="TCP flags, comma-separated (syn,ack,...) "
+                   "[extension: not in the design CLI]")
+    p.add_argument("--icmptype", help="ICMP type name or number "
+                   "[extension: not in the design CLI]")
+    p.add_argument("--icmpcode", help="ICMP code number "
+                   "[extension: not in the design CLI]")
+    p.add_argument("--in-interface-addr", dest="in_interface_addr",
+                   action="append", default=[],
+                   help="address of the input interface (accepted; "
+                   "recorded in coverage)")
+    p.add_argument("--includepath", action="append", default=[],
+                   help="extra directory to search for includes "
+                   "(repeatable)")
+    p.add_argument("--services", help="/etc/services-format file for "
+                   "hermetic service-name resolution (NF26)")
+    p.add_argument("--json", action="store_true",
+                   help="emit JSON mirroring the text output")
+    p.add_argument("--quiet", action="store_true",
+                   help="print only the verdict line (and NAT block)")
+    p.add_argument("--version", action="store_true",
+                   help="print version and exit")
+    p.add_argument("--list-chains", action="store_true",
+                   help="list all chains with hook/priority/policy")
+    p.add_argument("--list-sets", action="store_true",
+                   help="list all sets and maps")
+    return p
+
+
+def parse_address(text, what):
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        raise LoadError("%s %r is not a literal IP address" % (what, text))
+
+
+def parse_port(text, services, what):
+    n = parse_int(text)
+    if n is not None:
+        if 0 <= n <= 65535:
+            return n
+        raise LoadError("%s %r out of range" % (what, text))
+    if services and text in services:
+        return services[text]
+    raise LoadError("%s %r is not a number (service names resolve only "
+                    "via --services)" % (what, text))
+
+
+def load_services(path):
+    services = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    name = parts[0]
+                    port = parts[1].split("/")[0]
+                    try:
+                        services[name] = int(port)
+                    except ValueError:
+                        pass
+    except OSError as exc:
+        raise LoadError("cannot read services file %s: %s" % (path, exc))
+    return services
+
+
+def load_ruleset(conf_path, includepaths, services=None):
+    loader = StreamLoader(conf_path, includepaths)
+    stmts = loader.load()
+    ctx = EvalContext({}, Packet(), services=services)
+    parser = Parser(ctx)
+    tables = parser.parse(stmts)
+    ctx.tables = tables
+    ctx.findings.extend(loader.findings)
+    ctx.defines_expanded = loader.defines_expanded
+    ctx._unmodeled_commands = parser.unmodeled_commands
+    ctx._loader = loader
+    return tables, ctx, loader, parser
+
+
+def poison_from_unmodeled(tables, ctx, hook=None, path=None):
+    """NF29: an unmodeled delete/insert/replace/rename that names a
+    table/chain on the queried traversal poisons the answer."""
+    hooks = [hook] if hook else (PATH_HOOKS[path] if path else [])
+    for kind, fam, tbl, ch, f, l in ctx._unmodeled_commands:
+        if fam is None:
+            continue
+        for h in hooks:
+            for chain in base_chains_at(tables, h, None):
+                if chain.table.family == fam and chain.table.name == tbl \
+                        and (ch is None or chain.name == ch):
+                    return (f, l, "%s command names %s on the queried "
+                            "traversal (NF29)" % (kind, tbl))
+    return None
+
+
+def print_inventory(tables, ctx, list_chains, list_sets, as_json):
+    if as_json:
+        out = {"chains": [], "sets": []}
+        for (fam, _n), table in sorted(tables.items()):
+            for chain in table.chains.values():
+                out["chains"].append({
+                    "table": "%s %s" % (fam, table.name),
+                    "chain": chain.name, "type": chain.type,
+                    "hook": chain.hook, "priority": chain.priority,
+                    "policy": chain.policy, "file": chain.file,
+                    "line": chain.line, "rules": len(chain.rules)})
+            for s in table.sets.values():
+                out["sets"].append({
+                    "kind": "set", "table": "%s %s" % (fam, table.name),
+                    "name": s.name, "type": s.type,
+                    "flags": sorted(s.flags),
+                    "elements": len(s.elements),
+                    "file": s.file, "line": s.line})
+            for m in table.maps.values():
+                out["sets"].append({
+                    "kind": "map", "table": "%s %s" % (fam, table.name),
+                    "name": m.name, "type": "%s : %s" % (m.key_type,
+                                                         m.value_type),
+                    "flags": sorted(m.flags),
+                    "elements": len(m.elements),
+                    "file": m.file, "line": m.line})
+        print(json.dumps(out, indent=2))
+        return 0
+    if list_chains:
+        for (fam, _n), table in sorted(tables.items()):
+            for chain in table.chains.values():
+                print("%s %s chain %s type=%s hook=%s priority=%s "
+                      "policy=%s rules=%d [%s:%d]"
+                      % (fam, table.name, chain.name, chain.type or "-",
+                         chain.hook or "-", chain.priority
+                         if chain.priority is not None else "-",
+                         chain.policy, len(chain.rules),
+                         chain.file, chain.line))
+    if list_sets:
+        for (fam, _n), table in sorted(tables.items()):
+            for s in table.sets.values():
+                print("%s %s set %s type=%s flags=%s elements=%d [%s:%d]"
+                      % (fam, table.name, s.name, s.type or "-",
+                         ",".join(sorted(s.flags)) or "-",
+                         len(s.elements), s.file, s.line))
+            for m in table.maps.values():
+                print("%s %s map %s type=%s : %s flags=%s elements=%d "
+                      "[%s:%d]" % (fam, table.name, m.name,
+                                   m.key_type or "-",
+                                   m.value_type or "-",
+                                   ",".join(sorted(m.flags)) or "-",
+                                   len(m.elements), m.file, m.line))
+    return 0
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.version:
+        print("nftwho %s" % VERSION)
+        return 0
+    conf = args.conf_flag or args.conf
+    if args.conf_flag and args.conf and args.conf_flag != args.conf:
+        parser.error("--conf and positional file disagree")
+    if not conf:
+        parser.error("a ruleset file is required (positional or --conf)")
+    # inventory modes need no packet flags
+    if args.list_chains or args.list_sets:
+        if args.hook or args.path:
+            parser.error("--list-chains/--list-sets take no --hook/--path")
+        try:
+            tables, ctx, loader, _p = load_ruleset(conf, args.includepath)
+        except LoadError as exc:
+            print("nftwho: %s" % exc, file=sys.stderr)
+            return 2
+        return print_inventory(tables, ctx, args.list_chains,
+                               args.list_sets, args.json)
+    # packet query: exactly one of --hook / --path
+    if bool(args.hook) == bool(args.path):
+        parser.error("exactly one of --hook / --path is required")
+    try:
+        services = load_services(args.services) if args.services else {}
+        saddr = parse_address(args.saddr, "--saddr") if args.saddr else None
+        daddr = parse_address(args.daddr, "--daddr") if args.daddr else None
+        family = args.family
+        addr_fam = None
+        for a in (saddr, daddr):
+            if a is not None:
+                f = "ipv4" if isinstance(a, ipaddress.IPv4Address) else "ipv6"
+                if addr_fam and addr_fam != f:
+                    parser.error("--saddr and --daddr disagree in family")
+                addr_fam = f
+        if family and addr_fam and family != addr_fam:
+            parser.error("--family disagrees with the supplied addresses")
+        if not family:
+            family = addr_fam
+            if family is None and (saddr is None and daddr is None):
+                # no addresses at all: family stays unknown; ip/ip6
+                # expressions evaluate UNKNOWN (NF27), never defaulted
+                pass
+            elif family is None:
+                family = addr_fam
+        proto = None
+        if args.proto:
+            n = parse_int(args.proto)
+            if n is not None:
+                proto = n
+            elif args.proto.lower() in PROTOCOLS:
+                proto = PROTOCOLS[args.proto.lower()]
+            else:
+                parser.error("unknown protocol %r" % args.proto)
+        sport = parse_port(args.sport, services, "--sport") \
+            if args.sport else None
+        dport = parse_port(args.dport, services, "--dport") \
+            if args.dport else None
+        ctstate = set()
+        if args.ctstate:
+            for part in args.ctstate.split(","):
+                part = part.strip().lower()
+                if part not in CT_STATES:
+                    parser.error("unknown ct state %r" % part)
+                ctstate.add(part)
+        mark = parse_int(args.mark) if args.mark else None
+        if args.mark and mark is None:
+            parser.error("--mark %r is not a number" % args.mark)
+        tcpflags = None
+        if args.tcpflags:
+            bits = 0
+            for part in args.tcpflags.split(","):
+                part = part.strip().lower()
+                if part not in TCP_FLAG_BITS:
+                    parser.error("unknown tcp flag %r" % part)
+                bits |= TCP_FLAG_BITS[part]
+            tcpflags = bits
+        icmptype = None
+        if args.icmptype:
+            n = parse_int(args.icmptype)
+            if n is not None:
+                icmptype = n
+            elif args.icmptype.lower() in ICMP_TYPES:
+                icmptype = ICMP_TYPES[args.icmptype.lower()]
+            elif args.icmptype.lower() in ICMPV6_TYPES:
+                icmptype = ICMPV6_TYPES[args.icmptype.lower()]
+            else:
+                parser.error("unknown icmp type %r" % args.icmptype)
+        icmpcode = parse_int(args.icmpcode) if args.icmpcode else None
+        if args.icmpcode and icmpcode is None:
+            parser.error("--icmpcode %r is not a number" % args.icmpcode)
+        in_addrs = []
+        for a in args.in_interface_addr:
+            in_addrs.append(parse_address(a, "--in-interface-addr"))
+        pkt = Packet(family=family, saddr=saddr, daddr=daddr, proto=proto,
+                     sport=sport, dport=dport, iif=args.iif, oif=args.oif,
+                     ctstate=ctstate, mark=mark, tcpflags=tcpflags,
+                     icmptype=icmptype, icmpcode=icmpcode,
+                     in_iface_addrs=in_addrs)
+        tables, ctx, loader, _p = load_ruleset(conf, args.includepath,
+                                               services=services)
+        ctx.meta_mark = mark
+        ctx.ctstate = set(ctstate)
+        poison = poison_from_unmodeled(tables, ctx, args.hook, args.path)
+        query = {"hook": args.hook, "path": args.path, "family": family}
+        if poison:
+            result = {"verdict": "UNKNOWN",
+                      "decider": poison,
+                      "nat": [], "nat_unknown": False,
+                      "nat_skipped": False, "nat_fired": [],
+                      "hooks": [], "findings": ctx.findings,
+                      "state": WalkState()}
+            ctx.note_finding("unmodeled-command", poison[2],
+                             poison[0], poison[1])
+        else:
+            result = evaluate(tables, pkt, ctx, args.hook, args.path)
+        if args.json:
+            print(json.dumps(result_to_json(result, ctx, loader, tables,
+                                           query), indent=2))
+        elif args.quiet:
+            label = verdict_label(result)
+            d = result["decider"]
+            if d:
+                print("%s — %s:%s (%s)" % (label, d[0], d[1], d[2]))
+            else:
+                print(label)
+            if result["nat_skipped"]:
+                print("NAT: skipped (not first packet)")
+            elif result["nat_unknown"]:
+                print("NAT: UNKNOWN (ctstate not supplied)")
+            elif result["nat"]:
+                for o in result["nat"]:
+                    tgt = (" to %s" % o["target"]) if o.get("target") else ""
+                    print("NAT: %s%s (rule at %s:%d)"
+                          % (o["kind"], tgt, o["file"], o["line"]))
+        else:
+            print(render_text(result, ctx, loader, tables, query), end="")
+        return exit_code_for(result)
+    except LoadError as exc:
+        print("nftwho: %s" % exc, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
